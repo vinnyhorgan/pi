@@ -12,7 +12,7 @@ import {
   withFileMutationQueue,
 } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { Text } from "@mariozechner/pi-tui";
+import { Text, type Component } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 type SearchDepth = "basic" | "fast" | "advanced" | "ultra-fast";
@@ -450,6 +450,28 @@ function listLines(items: string[]): string {
   return items.map((item) => `- ${item}`).join("\n");
 }
 
+const HIDDEN_COMPONENT: Component = {
+  render() {
+    return [];
+  },
+  invalidate() {},
+};
+
+function getStringProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return typeof record[key] === "string" ? (record[key] as string) : undefined;
+}
+
+function getArrayLengthProperty(
+  value: unknown,
+  key: string,
+): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return Array.isArray(record[key]) ? record[key].length : undefined;
+}
+
 function normalizeStringArray(
   value: unknown,
   options?: { splitCommas?: boolean },
@@ -722,16 +744,27 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         } as SearchDetails,
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
+      if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_search "));
-      text += theme.fg("accent", JSON.stringify(args.query));
-      if (args.topic) text += theme.fg("dim", ` ${args.topic}`);
-      if (args.search_depth) text += theme.fg("dim", ` ${args.search_depth}`);
+      const query = getStringProperty(args, "query");
+      text += theme.fg("accent", query ? JSON.stringify(query) : "");
+      const topic = getStringProperty(args, "topic");
+      if (topic) text += theme.fg("dim", ` ${topic}`);
+      const searchDepth = getStringProperty(args, "search_depth");
+      if (searchDepth) text += theme.fg("dim", ` ${searchDepth}`);
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as SearchDetails | undefined;
-      if (!details) return new Text(theme.fg("dim", "No search details"), 0, 0);
+      if (
+        !details ||
+        typeof details.resultCount !== "number" ||
+        typeof details.query !== "string"
+      ) {
+        return HIDDEN_COMPONENT;
+      }
       let text = theme.fg(
         "success",
         `${details.resultCount} result${details.resultCount === 1 ? "" : "s"}`,
@@ -829,20 +862,30 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         } as ExtractDetails,
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
+      if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_extract "));
+      const urlCount = getArrayLengthProperty(args, "urls");
       text += theme.fg(
         "accent",
-        `${args.urls.length} URL${args.urls.length === 1 ? "" : "s"}`,
+        urlCount === undefined
+          ? ""
+          : `${urlCount} URL${urlCount === 1 ? "" : "s"}`,
       );
-      if (args.query)
-        text += theme.fg("dim", ` query=${JSON.stringify(args.query)}`);
+      const query = getStringProperty(args, "query");
+      if (query) text += theme.fg("dim", ` query=${JSON.stringify(query)}`);
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as ExtractDetails | undefined;
-      if (!details)
-        return new Text(theme.fg("dim", "No extraction details"), 0, 0);
+      if (
+        !details ||
+        typeof details.successCount !== "number" ||
+        typeof details.urlCount !== "number"
+      ) {
+        return HIDDEN_COMPONENT;
+      }
       let text = theme.fg(
         "success",
         `${details.successCount}/${details.urlCount} extracted`,
@@ -930,15 +973,25 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         } as MapDetails,
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
+      if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_map "));
-      text += theme.fg("accent", args.url);
-      if (args.instructions) text += theme.fg("dim", " guided");
+      const url = getStringProperty(args, "url");
+      text += theme.fg("accent", url ?? "");
+      if (getStringProperty(args, "instructions"))
+        text += theme.fg("dim", " guided");
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme) {
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as MapDetails | undefined;
-      if (!details) return new Text(theme.fg("dim", "No map details"), 0, 0);
+      if (
+        !details ||
+        typeof details.resultCount !== "number" ||
+        typeof details.url !== "string"
+      ) {
+        return HIDDEN_COMPONENT;
+      }
       let text = theme.fg(
         "success",
         `${details.resultCount} URL${details.resultCount === 1 ? "" : "s"} discovered`,
@@ -1038,15 +1091,25 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         } as CrawlDetails,
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
+      if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_crawl "));
-      text += theme.fg("accent", args.url);
-      if (args.instructions) text += theme.fg("dim", " guided");
+      const url = getStringProperty(args, "url");
+      text += theme.fg("accent", url ?? "");
+      if (getStringProperty(args, "instructions"))
+        text += theme.fg("dim", " guided");
       return new Text(text, 0, 0);
     },
-    renderResult(result, _options, theme) {
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as CrawlDetails | undefined;
-      if (!details) return new Text(theme.fg("dim", "No crawl details"), 0, 0);
+      if (
+        !details ||
+        typeof details.pageCount !== "number" ||
+        typeof details.url !== "string"
+      ) {
+        return HIDDEN_COMPONENT;
+      }
       let text = theme.fg(
         "success",
         `${details.pageCount} page${details.pageCount === 1 ? "" : "s"} collected`,
