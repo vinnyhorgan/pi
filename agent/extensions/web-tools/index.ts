@@ -180,14 +180,20 @@ const SearchParams = Type.Object({
     Type.String({ description: "Only results before YYYY-MM-DD" }),
   ),
   include_answer: Type.Optional(
-    StringEnum(["none", "basic", "advanced"] as const, {
-      description: "Include a synthesized answer",
-    }),
+    Type.Union([
+      Type.Boolean({ description: "Whether to include a synthesized answer" }),
+      StringEnum(["none", "basic", "advanced"] as const, {
+        description: "Answer mode. true behaves like basic.",
+      }),
+    ]),
   ),
   include_raw_content: Type.Optional(
-    StringEnum(["none", "markdown", "text"] as const, {
-      description: "Include parsed source content in results",
-    }),
+    Type.Union([
+      Type.Boolean({ description: "Whether to include parsed source content" }),
+      StringEnum(["none", "markdown", "text"] as const, {
+        description: "Raw content mode. true behaves like markdown.",
+      }),
+    ]),
   ),
   include_images: Type.Optional(
     Type.Boolean({ description: "Include image results" }),
@@ -463,6 +469,22 @@ function normalizeStringArray(value: unknown): string[] | undefined {
   return undefined;
 }
 
+function normalizeIncludeAnswer(value: unknown): false | "basic" | "advanced" {
+  if (value === true) return "basic";
+  if (value === false || value === undefined || value === "none") return false;
+  if (value === "basic" || value === "advanced") return value;
+  return false;
+}
+
+function normalizeIncludeRawContent(
+  value: unknown,
+): false | "markdown" | "text" {
+  if (value === true) return "markdown";
+  if (value === false || value === undefined || value === "none") return false;
+  if (value === "markdown" || value === "text") return value;
+  return false;
+}
+
 function coerceCommonListArguments<T extends Record<string, unknown>>(
   args: unknown,
   keys: Array<keyof T>,
@@ -530,10 +552,21 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: SearchParams,
     prepareArguments(args) {
-      return coerceCommonListArguments(args, [
+      const normalized = coerceCommonListArguments(args, [
         "include_domains",
         "exclude_domains",
       ]);
+      if (!normalized || typeof normalized !== "object") return normalized;
+      const input = { ...(normalized as Record<string, unknown>) };
+      if ("include_answer" in input) {
+        input.include_answer = normalizeIncludeAnswer(input.include_answer);
+      }
+      if ("include_raw_content" in input) {
+        input.include_raw_content = normalizeIncludeRawContent(
+          input.include_raw_content,
+        );
+      }
+      return input;
     },
     async execute(_toolCallId, params) {
       const client = createClient();
@@ -546,16 +579,10 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         timeRange: params.time_range,
         startDate: params.start_date,
         endDate: params.end_date,
-        includeAnswer:
-          params.include_answer === undefined ||
-          params.include_answer === "none"
-            ? false
-            : params.include_answer,
-        includeRawContent:
-          params.include_raw_content === undefined ||
-          params.include_raw_content === "none"
-            ? false
-            : params.include_raw_content,
+        includeAnswer: normalizeIncludeAnswer(params.include_answer),
+        includeRawContent: normalizeIncludeRawContent(
+          params.include_raw_content,
+        ),
         includeImages: params.include_images,
         includeImageDescriptions: params.include_image_descriptions,
         includeDomains: params.include_domains,
