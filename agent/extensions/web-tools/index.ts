@@ -1,7 +1,6 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { tavily } from "@tavily/core";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -451,7 +450,11 @@ function listLines(items: string[]): string {
   return items.map((item) => `- ${item}`).join("\n");
 }
 
-function normalizeStringArray(value: unknown): string[] | undefined {
+function normalizeStringArray(
+  value: unknown,
+  options?: { splitCommas?: boolean },
+): string[] | undefined {
+  const splitCommas = options?.splitCommas ?? false;
   if (Array.isArray(value)) {
     const items = value
       .filter((item): item is string => typeof item === "string")
@@ -461,7 +464,7 @@ function normalizeStringArray(value: unknown): string[] | undefined {
   }
   if (typeof value === "string") {
     const items = value
-      .split(/[\n,]/)
+      .split(splitCommas ? /[\n,]/ : /\n/)
       .map((item) => item.trim())
       .filter(Boolean);
     return items.length > 0 ? items : undefined;
@@ -488,11 +491,12 @@ function normalizeIncludeRawContent(
 function coerceCommonListArguments<T extends Record<string, unknown>>(
   args: unknown,
   keys: Array<keyof T>,
+  options?: { splitCommas?: boolean },
 ): T | unknown {
   if (!args || typeof args !== "object") return args;
   const input = { ...(args as Record<string, unknown>) };
   for (const key of keys) {
-    const normalized = normalizeStringArray(input[key as string]);
+    const normalized = normalizeStringArray(input[key as string], options);
     if (normalized) input[key as string] = normalized;
   }
   return input;
@@ -525,18 +529,76 @@ function createClient() {
   }
 
   const projectId = process.env.TAVILY_PROJECT;
-  return tavily(projectId ? { apiKey, projectId } : { apiKey });
+  return {
+    apiKey,
+    projectId,
+  };
+}
+
+async function postTavily<T>(
+  endpoint: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+  timeoutSeconds = 60,
+): Promise<T> {
+  const client = createClient();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${client.apiKey}`,
+    "Content-Type": "application/json",
+    "X-Client-Source": "pi-web-tools",
+  };
+  if (client.projectId) headers["X-Project-ID"] = client.projectId;
+
+  const timeoutSignal = AbortSignal.timeout(timeoutSeconds * 1000);
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+
+  let response: Response;
+  try {
+    response = await fetch(`https://api.tavily.com/${endpoint}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: requestSignal,
+    });
+  } catch (error) {
+    if (timeoutSignal.aborted && !signal?.aborted) {
+      throw new Error(`Request timed out after ${timeoutSeconds} seconds.`);
+    }
+    throw error;
+  }
+
+  if (!response.ok) {
+    const responseText = await response.text();
+    let message = responseText;
+    try {
+      const parsed = JSON.parse(responseText) as {
+        detail?: { error?: string };
+      };
+      message = parsed.detail?.error ?? responseText;
+    } catch {
+      // Keep raw response text when not JSON.
+    }
+    throw new Error(
+      message || `Tavily ${endpoint} failed (${response.status})`,
+    );
+  }
+
+  return (await response.json()) as T;
 }
 
 export default function webToolsExtension(pi: ExtensionAPI) {
+  const hasApiKey = Boolean(process.env.TAVILY_API_KEY);
+
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.setStatus(
       "web-tools",
-      process.env.TAVILY_API_KEY
-        ? undefined
-        : "web tools unavailable: set TAVILY_API_KEY",
+      hasApiKey ? undefined : "web tools unavailable: set TAVILY_API_KEY",
     );
   });
+
+  if (!hasApiKey) return;
 
   pi.registerTool({
     name: "web_search",
@@ -552,10 +614,11 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: SearchParams,
     prepareArguments(args) {
-      const normalized = coerceCommonListArguments(args, [
-        "include_domains",
-        "exclude_domains",
-      ]);
+      const normalized = coerceCommonListArguments(
+        args,
+        ["include_domains", "exclude_domains"],
+        { splitCommas: true },
+      );
       if (!normalized || typeof normalized !== "object") return normalized;
       const input = { ...(normalized as Record<string, unknown>) };
       if ("include_answer" in input) {
@@ -568,30 +631,35 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       }
       return input;
     },
-    async execute(_toolCallId, params) {
-      const client = createClient();
+    async execute(_toolCallId, params, signal) {
       const searchDepth = params.search_depth ?? "basic";
       const topic = params.topic ?? "general";
-      const response = (await client.search(params.query, {
-        maxResults: params.max_results,
-        searchDepth,
-        topic,
-        timeRange: params.time_range,
-        startDate: params.start_date,
-        endDate: params.end_date,
-        includeAnswer: normalizeIncludeAnswer(params.include_answer),
-        includeRawContent: normalizeIncludeRawContent(
-          params.include_raw_content,
-        ),
-        includeImages: params.include_images,
-        includeImageDescriptions: params.include_image_descriptions,
-        includeDomains: params.include_domains,
-        excludeDomains: params.exclude_domains,
-        country: params.country,
-        exactMatch: params.exact_match,
-        includeFavicon: params.include_favicon,
-        includeUsage: true,
-      })) as SearchResponse;
+      const response = await postTavily<SearchResponse>(
+        "search",
+        {
+          query: params.query,
+          max_results: params.max_results,
+          search_depth: searchDepth,
+          topic,
+          time_range: params.time_range,
+          start_date: params.start_date,
+          end_date: params.end_date,
+          include_answer: normalizeIncludeAnswer(params.include_answer),
+          include_raw_content: normalizeIncludeRawContent(
+            params.include_raw_content,
+          ),
+          include_images: params.include_images,
+          include_image_descriptions: params.include_image_descriptions,
+          include_domains: params.include_domains,
+          exclude_domains: params.exclude_domains,
+          country: params.country,
+          exact_match: params.exact_match,
+          include_favicon: params.include_favicon,
+          include_usage: true,
+        },
+        signal,
+        60,
+      );
 
       const lines: string[] = [];
       if (response.answer) {
@@ -693,24 +761,29 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     prepareArguments(args) {
       if (!args || typeof args !== "object") return args;
       const input = { ...(args as Record<string, unknown>) };
-      const urls = normalizeStringArray(input.urls);
+      const urls = normalizeStringArray(input.urls, { splitCommas: true });
       if (urls) input.urls = urls;
       return input;
     },
-    async execute(_toolCallId, params) {
-      const client = createClient();
+    async execute(_toolCallId, params, signal) {
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = (await client.extract(params.urls, {
-        extractDepth,
-        format,
-        query: params.query,
-        chunksPerSource: params.chunks_per_source,
-        includeImages: params.include_images,
-        includeFavicon: params.include_favicon,
-        timeout: params.timeout,
-        includeUsage: true,
-      })) as ExtractResponse;
+      const response = await postTavily<ExtractResponse>(
+        "extract",
+        {
+          urls: params.urls,
+          extract_depth: extractDepth,
+          format,
+          query: params.query,
+          chunks_per_source: params.chunks_per_source,
+          include_images: params.include_images,
+          include_favicon: params.include_favicon,
+          timeout: params.timeout,
+          include_usage: true,
+        },
+        signal,
+        params.timeout ?? 30,
+      );
 
       const failed = response.failedResults ?? response.failed_results ?? [];
       const lines: string[] = [
@@ -807,23 +880,28 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         "exclude_domains",
       ]);
     },
-    async execute(_toolCallId, params) {
-      const client = createClient();
+    async execute(_toolCallId, params, signal) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
-      const response = (await client.map(params.url, {
-        maxDepth,
-        maxBreadth: params.max_breadth,
-        limit,
-        instructions: params.instructions,
-        selectPaths: params.select_paths,
-        excludePaths: params.exclude_paths,
-        selectDomains: params.select_domains,
-        excludeDomains: params.exclude_domains,
-        allowExternal: params.allow_external,
-        timeout: params.timeout,
-        includeUsage: true,
-      })) as MapResponse;
+      const response = await postTavily<MapResponse>(
+        "map",
+        {
+          url: params.url,
+          max_depth: maxDepth,
+          max_breadth: params.max_breadth,
+          limit,
+          instructions: params.instructions,
+          select_paths: params.select_paths,
+          exclude_paths: params.exclude_paths,
+          select_domains: params.select_domains,
+          exclude_domains: params.exclude_domains,
+          allow_external: params.allow_external,
+          timeout: params.timeout,
+          include_usage: true,
+        },
+        signal,
+        params.timeout ?? 150,
+      );
 
       const lines = [
         `Mapped ${response.baseUrl ?? response.base_url ?? params.url}`,
@@ -892,30 +970,35 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         "exclude_domains",
       ]);
     },
-    async execute(_toolCallId, params) {
-      const client = createClient();
+    async execute(_toolCallId, params, signal) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = (await client.crawl(params.url, {
-        maxDepth,
-        maxBreadth: params.max_breadth,
-        limit,
-        instructions: params.instructions,
-        chunksPerSource: params.chunks_per_source,
-        selectPaths: params.select_paths,
-        excludePaths: params.exclude_paths,
-        selectDomains: params.select_domains,
-        excludeDomains: params.exclude_domains,
-        allowExternal: params.allow_external,
-        extractDepth,
-        format,
-        includeImages: params.include_images,
-        includeFavicon: params.include_favicon,
-        timeout: params.timeout,
-        includeUsage: true,
-      })) as CrawlResponse;
+      const response = await postTavily<CrawlResponse>(
+        "crawl",
+        {
+          url: params.url,
+          max_depth: maxDepth,
+          max_breadth: params.max_breadth,
+          limit,
+          instructions: params.instructions,
+          chunks_per_source: params.chunks_per_source,
+          select_paths: params.select_paths,
+          exclude_paths: params.exclude_paths,
+          select_domains: params.select_domains,
+          exclude_domains: params.exclude_domains,
+          allow_external: params.allow_external,
+          extract_depth: extractDepth,
+          format,
+          include_images: params.include_images,
+          include_favicon: params.include_favicon,
+          timeout: params.timeout,
+          include_usage: true,
+        },
+        signal,
+        params.timeout ?? 150,
+      );
 
       const lines: string[] = [
         `Crawled ${response.baseUrl ?? response.base_url ?? params.url}`,
