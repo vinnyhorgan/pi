@@ -1,0 +1,17 @@
+{
+  "name": "pi-web-tools",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "check": "echo 'no local check configured'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@tavily/core": "^0.7.2"
+  }
+}
