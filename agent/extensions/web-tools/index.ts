@@ -9,8 +9,8 @@ import {
   type Theme,
   type TruncationResult,
   truncateHead,
-  withFileMutationQueue,
 } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, type Component } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
@@ -89,34 +89,18 @@ const SearchParams = Type.Object({
     }),
   ),
   search_depth: Type.Optional(
-    Type.Union(
-      [
-        Type.Literal("basic"),
-        Type.Literal("fast"),
-        Type.Literal("advanced"),
-        Type.Literal("ultra-fast"),
-      ],
-      { description: "Latency vs relevance tradeoff" },
-    ),
+    StringEnum(["basic", "fast", "advanced", "ultra-fast"] as const, {
+      description: "Latency vs relevance tradeoff",
+    }),
   ),
   topic: Type.Optional(
-    Type.Union(
-      [Type.Literal("general"), Type.Literal("news"), Type.Literal("finance")],
-      { description: "Search topic specialization" },
-    ),
+    StringEnum(["general", "news", "finance"] as const, {
+      description: "Search topic specialization",
+    }),
   ),
   time_range: Type.Optional(
-    Type.Union(
-      [
-        Type.Literal("day"),
-        Type.Literal("week"),
-        Type.Literal("month"),
-        Type.Literal("year"),
-        Type.Literal("d"),
-        Type.Literal("w"),
-        Type.Literal("m"),
-        Type.Literal("y"),
-      ],
+    StringEnum(
+      ["day", "week", "month", "year", "d", "w", "m", "y"] as const,
       { description: "Relative freshness window" },
     ),
   ),
@@ -134,20 +118,14 @@ const SearchParams = Type.Object({
     }),
   ),
   include_answer: Type.Optional(
-    Type.Union([
-      Type.Boolean({ description: "Whether to include a synthesized answer" }),
-      Type.Literal("none"),
-      Type.Literal("basic"),
-      Type.Literal("advanced"),
-    ]),
+    StringEnum(["none", "basic", "advanced"] as const, {
+      description: "Synthesized answer mode",
+    }),
   ),
   include_raw_content: Type.Optional(
-    Type.Union([
-      Type.Boolean({ description: "Whether to include parsed source content" }),
-      Type.Literal("none"),
-      Type.Literal("markdown"),
-      Type.Literal("text"),
-    ]),
+    StringEnum(["none", "markdown", "text"] as const, {
+      description: "Include parsed source content in this format",
+    }),
   ),
   include_images: Type.Optional(
     Type.Boolean({ description: "Include image results" }),
@@ -182,9 +160,6 @@ const SearchParams = Type.Object({
   include_usage: Type.Optional(
     Type.Boolean({ description: "Include credit usage info" }),
   ),
-  safe_search: Type.Optional(
-    Type.Boolean({ description: "Filter unsafe content when supported" }),
-  ),
   timeout: Type.Optional(
     Type.Number({ minimum: 1, maximum: 60, description: "Timeout in seconds" }),
   ),
@@ -197,12 +172,12 @@ const ExtractParams = Type.Object({
     description: "One or more URLs to extract",
   }),
   extract_depth: Type.Optional(
-    Type.Union([Type.Literal("basic"), Type.Literal("advanced")], {
+    StringEnum(["basic", "advanced"] as const, {
       description: "Advanced handles harder pages and embedded content",
     }),
   ),
   format: Type.Optional(
-    Type.Union([Type.Literal("markdown"), Type.Literal("text")], {
+    StringEnum(["markdown", "text"] as const, {
       description: "Output format",
     }),
   ),
@@ -344,12 +319,12 @@ const CrawlParams = Type.Object({
     Type.Boolean({ description: "Include external-domain links" }),
   ),
   extract_depth: Type.Optional(
-    Type.Union([Type.Literal("basic"), Type.Literal("advanced")], {
+    StringEnum(["basic", "advanced"] as const, {
       description: "Advanced extracts harder content",
     }),
   ),
   format: Type.Optional(
-    Type.Union([Type.Literal("markdown"), Type.Literal("text")], {
+    StringEnum(["markdown", "text"] as const, {
       description: "Output format",
     }),
   ),
@@ -413,14 +388,14 @@ function normalizeQuery(value: unknown): string | undefined {
 }
 
 function normalizeAnswerMode(value: unknown): AnswerMode {
-  if (value === true) return "basic";
-  if (value === "basic" || value === "advanced") return value;
+  if (value === true || value === "basic") return "basic";
+  if (value === "advanced") return "advanced";
   return false;
 }
 
 function normalizeRawContentMode(value: unknown): RawContentMode {
-  if (value === true) return "markdown";
-  if (value === "markdown" || value === "text") return value;
+  if (value === true || value === "markdown") return "markdown";
+  if (value === "text") return "text";
   return false;
 }
 
@@ -466,9 +441,7 @@ function renderMeta(details: ToolMeta, theme: Theme): string {
 async function writeTempJson(prefix: string, value: unknown): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), `${prefix}-`));
   const filePath = join(dir, "response.json");
-  await withFileMutationQueue(filePath, async () => {
-    await writeFile(filePath, JSON.stringify(value, null, 2), "utf8");
-  });
+  await writeFile(filePath, JSON.stringify(value, null, 2), "utf8");
   return filePath;
 }
 
@@ -501,6 +474,19 @@ function createClient(): TavilyClient | undefined {
     apiKey,
     projectId: process.env.TAVILY_PROJECT,
     clientSource: "web-tools",
+  });
+}
+
+function rejectOnAbort(signal: AbortSignal | undefined): Promise<never> {
+  if (!signal) return new Promise(() => {});
+  return new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () =>
+      reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -538,40 +524,45 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       const excludeDomains = normalizeStringArray(input.exclude_domains, true);
       if (includeDomains) input.include_domains = includeDomains;
       if (excludeDomains) input.exclude_domains = excludeDomains;
-      if ("include_answer" in input)
-        input.include_answer = normalizeAnswerMode(input.include_answer);
+      if ("include_answer" in input) {
+        const val = input.include_answer;
+        if (val === true) input.include_answer = "basic";
+        else if (val === false || val === "none") input.include_answer = "none";
+      }
       if ("include_raw_content" in input) {
-        input.include_raw_content = normalizeRawContentMode(
-          input.include_raw_content,
-        );
+        const val = input.include_raw_content;
+        if (val === true) input.include_raw_content = "markdown";
+        else if (val === false || val === "none") input.include_raw_content = "none";
       }
       return input;
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const searchDepth = params.search_depth ?? "basic";
       const topic = params.topic ?? "general";
-      const response = await client.search(params.query, {
-        searchDepth,
-        topic,
-        maxResults: params.max_results,
-        timeRange: params.time_range,
-        startDate: params.start_date,
-        endDate: params.end_date,
-        chunksPerSource: params.chunks_per_source,
-        includeAnswer: normalizeAnswerMode(params.include_answer),
-        includeRawContent: normalizeRawContentMode(params.include_raw_content),
-        includeImages: params.include_images,
-        includeImageDescriptions: params.include_image_descriptions,
-        includeDomains: params.include_domains,
-        excludeDomains: params.exclude_domains,
-        country: params.country,
-        autoParameters: params.auto_parameters,
-        exactMatch: params.exact_match,
-        includeFavicon: params.include_favicon,
-        includeUsage: params.include_usage ?? true,
-        safe_search: params.safe_search,
-        timeout: params.timeout,
-      });
+      const response = await Promise.race([
+        client.search(params.query, {
+          searchDepth,
+          topic,
+          maxResults: params.max_results,
+          timeRange: params.time_range,
+          startDate: params.start_date,
+          endDate: params.end_date,
+          chunksPerSource: params.chunks_per_source,
+          includeAnswer: normalizeAnswerMode(params.include_answer),
+          includeRawContent: normalizeRawContentMode(params.include_raw_content),
+          includeImages: params.include_images,
+          includeImageDescriptions: params.include_image_descriptions,
+          includeDomains: params.include_domains,
+          excludeDomains: params.exclude_domains,
+          country: params.country,
+          autoParameters: params.auto_parameters,
+          exactMatch: params.exact_match,
+          includeFavicon: params.include_favicon,
+          includeUsage: params.include_usage ?? true,
+          timeout: params.timeout,
+        }),
+        rejectOnAbort(signal),
+      ]);
 
       const lines: string[] = [];
       if (response.answer) lines.push("Answer:", response.answer, "");
@@ -687,19 +678,22 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       if (urls) input.urls = urls;
       return input;
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = await client.extract(params.urls, {
-        extractDepth,
-        format,
-        query: params.query,
-        chunksPerSource: params.chunks_per_source,
-        includeImages: params.include_images,
-        includeFavicon: params.include_favicon,
-        includeUsage: params.include_usage ?? true,
-        timeout: params.timeout,
-      } satisfies TavilyExtractOptions);
+      const response = await Promise.race([
+        client.extract(params.urls, {
+          extractDepth,
+          format,
+          query: params.query,
+          chunksPerSource: params.chunks_per_source,
+          includeImages: params.include_images,
+          includeFavicon: params.include_favicon,
+          includeUsage: params.include_usage ?? true,
+          timeout: params.timeout,
+        } satisfies TavilyExtractOptions),
+        rejectOnAbort(signal),
+      ]);
 
       const lines: string[] = [
         `Extracted ${response.results.length} of ${params.urls.length} URL${params.urls.length === 1 ? "" : "s"}.`,
@@ -800,22 +794,25 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       }
       return input;
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
-      const response = await client.map(params.url, {
-        maxDepth,
-        maxBreadth: params.max_breadth,
-        limit,
-        instructions: params.instructions,
-        selectPaths: params.select_paths,
-        excludePaths: params.exclude_paths,
-        selectDomains: params.select_domains,
-        excludeDomains: params.exclude_domains,
-        allowExternal: params.allow_external,
-        includeUsage: params.include_usage ?? true,
-        timeout: params.timeout,
-      } satisfies TavilyMapOptions);
+      const response = await Promise.race([
+        client.map(params.url, {
+          maxDepth,
+          maxBreadth: params.max_breadth,
+          limit,
+          instructions: params.instructions,
+          selectPaths: params.select_paths,
+          excludePaths: params.exclude_paths,
+          selectDomains: params.select_domains,
+          excludeDomains: params.exclude_domains,
+          allowExternal: params.allow_external,
+          includeUsage: params.include_usage ?? true,
+          timeout: params.timeout,
+        } satisfies TavilyMapOptions),
+        rejectOnAbort(signal),
+      ]);
 
       const built = await buildTextResult(
         "pi-web-map",
@@ -891,29 +888,32 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       }
       return input;
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = await client.crawl(params.url, {
-        maxDepth,
-        maxBreadth: params.max_breadth,
-        limit,
-        instructions: params.instructions,
-        chunksPerSource: params.chunks_per_source,
-        selectPaths: params.select_paths,
-        excludePaths: params.exclude_paths,
-        selectDomains: params.select_domains,
-        excludeDomains: params.exclude_domains,
-        allowExternal: params.allow_external,
-        extractDepth,
-        format,
-        includeImages: params.include_images,
-        includeFavicon: params.include_favicon,
-        includeUsage: params.include_usage ?? true,
-        timeout: params.timeout,
-      } satisfies TavilyCrawlOptions);
+      const response = await Promise.race([
+        client.crawl(params.url, {
+          maxDepth,
+          maxBreadth: params.max_breadth,
+          limit,
+          instructions: params.instructions,
+          chunksPerSource: params.chunks_per_source,
+          selectPaths: params.select_paths,
+          excludePaths: params.exclude_paths,
+          selectDomains: params.select_domains,
+          excludeDomains: params.exclude_domains,
+          allowExternal: params.allow_external,
+          extractDepth,
+          format,
+          includeImages: params.include_images,
+          includeFavicon: params.include_favicon,
+          includeUsage: params.include_usage ?? true,
+          timeout: params.timeout,
+        } satisfies TavilyCrawlOptions),
+        rejectOnAbort(signal),
+      ]);
 
       const lines: string[] = [
         `Crawled ${response.baseUrl}`,
