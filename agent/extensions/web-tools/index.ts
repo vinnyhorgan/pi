@@ -397,6 +397,21 @@ function normalizeStringArray(
   return items.length > 0 ? items : undefined;
 }
 
+function normalizeQuery(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  const queries = normalizeStringArray(value, true);
+  if (!queries || queries.length === 0) return undefined;
+
+  // Gemini sometimes emits `queries: [...]` for the first search call in a
+  // fresh session even though the schema expects a single `query` string.
+  // Accept the first useful query instead of forcing a noisy retry.
+  return queries[0];
+}
+
 function normalizeAnswerMode(value: unknown): AnswerMode {
   if (value === true) return "basic";
   if (value === "basic" || value === "advanced") return value;
@@ -517,6 +532,8 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     prepareArguments(args) {
       if (!args || typeof args !== "object") return args;
       const input = { ...(args as Record<string, unknown>) };
+      const query = normalizeQuery(input.query ?? input.queries);
+      if (query) input.query = query;
       const includeDomains = normalizeStringArray(input.include_domains, true);
       const excludeDomains = normalizeStringArray(input.exclude_domains, true);
       if (includeDomains) input.include_domains = includeDomains;
@@ -623,10 +640,10 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_search "));
-      text += theme.fg(
-        "accent",
-        JSON.stringify(getString(args, "query") ?? ""),
+      const query = normalizeQuery(
+        getString(args, "query") ?? (args as Record<string, unknown>).queries,
       );
+      text += theme.fg("accent", JSON.stringify(query ?? ""));
       const topic = getString(args, "topic");
       const searchDepth = getString(args, "search_depth");
       if (topic) text += theme.fg("dim", ` ${topic}`);
