@@ -1,6 +1,6 @@
 {
   "lastChangelogVersion": "0.67.3",
-  "defaultProvider": "google-antigravity",
-  "defaultModel": "gemini-3-flash",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.4-mini",
   "defaultThinkingLevel": "medium"
 }
