@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.67.2",
+  "lastChangelogVersion": "0.67.3",
   "defaultProvider": "google-antigravity",
   "defaultModel": "gemini-3-flash",
   "defaultThinkingLevel": "medium"
