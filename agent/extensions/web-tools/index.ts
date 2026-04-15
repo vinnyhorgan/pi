@@ -99,10 +99,9 @@ const SearchParams = Type.Object({
     }),
   ),
   time_range: Type.Optional(
-    StringEnum(
-      ["day", "week", "month", "year", "d", "w", "m", "y"] as const,
-      { description: "Relative freshness window" },
-    ),
+    StringEnum(["day", "week", "month", "year", "d", "w", "m", "y"] as const, {
+      description: "Relative freshness window",
+    }),
   ),
   start_date: Type.Optional(
     Type.String({ description: "Only results after YYYY-MM-DD" }),
@@ -484,8 +483,7 @@ function rejectOnAbort(signal: AbortSignal | undefined): Promise<never> {
       reject(new DOMException("Aborted", "AbortError"));
       return;
     }
-    const onAbort = () =>
-      reject(new DOMException("Aborted", "AbortError"));
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
@@ -532,7 +530,8 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       if ("include_raw_content" in input) {
         const val = input.include_raw_content;
         if (val === true) input.include_raw_content = "markdown";
-        else if (val === false || val === "none") input.include_raw_content = "none";
+        else if (val === false || val === "none")
+          input.include_raw_content = "none";
       }
       return input;
     },
@@ -549,7 +548,9 @@ export default function webToolsExtension(pi: ExtensionAPI) {
           endDate: params.end_date,
           chunksPerSource: params.chunks_per_source,
           includeAnswer: normalizeAnswerMode(params.include_answer),
-          includeRawContent: normalizeRawContentMode(params.include_raw_content),
+          includeRawContent: normalizeRawContentMode(
+            params.include_raw_content,
+          ),
           includeImages: params.include_images,
           includeImageDescriptions: params.include_image_descriptions,
           includeDomains: params.include_domains,
