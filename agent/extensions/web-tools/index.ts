@@ -11,98 +11,30 @@ import {
   truncateHead,
   withFileMutationQueue,
 } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, type Component } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import {
+  tavily,
+  type TavilyClient,
+  type TavilyCrawlOptions,
+  type TavilyExtractOptions,
+  type TavilyExtractResponse,
+  type TavilyMapOptions,
+  type TavilySearchOptions,
+  type TavilySearchResponse,
+} from "@tavily/core";
 
 type SearchDepth = "basic" | "fast" | "advanced" | "ultra-fast";
 type SearchTopic = "general" | "news" | "finance";
 type ExtractDepth = "basic" | "advanced";
 type OutputFormat = "markdown" | "text";
+type AnswerMode = false | "basic" | "advanced";
+type RawContentMode = false | "markdown" | "text";
 
-interface ImageResult {
-  url: string;
-  description?: string;
-}
-
-interface SearchResult {
-  title: string;
-  url: string;
-  content: string;
-  score: number;
-  rawContent?: string;
-  publishedDate?: string;
-  favicon?: string;
+type ImageResult = { url: string; description?: string };
+type SearchResultWithImages = TavilySearchResponse["results"][number] & {
   images?: Array<string | ImageResult>;
-}
-
-interface SearchResponse {
-  query: string;
-  results: SearchResult[];
-  answer?: string;
-  images?: Array<string | ImageResult>;
-  requestId?: string;
-  request_id?: string;
-  responseTime?: number;
-  response_time?: number;
-  usage?: { credits?: number };
-  autoParameters?: Record<string, unknown>;
-  auto_parameters?: Record<string, unknown>;
-}
-
-interface ExtractResult {
-  url: string;
-  rawContent?: string;
-  raw_content?: string;
-  images?: string[];
-  favicon?: string;
-}
-
-interface ExtractFailure {
-  url: string;
-  error: string;
-}
-
-interface ExtractResponse {
-  results: ExtractResult[];
-  failedResults?: ExtractFailure[];
-  failed_results?: ExtractFailure[];
-  requestId?: string;
-  request_id?: string;
-  responseTime?: number;
-  response_time?: number;
-  usage?: { credits?: number };
-}
-
-interface MapResponse {
-  baseUrl?: string;
-  base_url?: string;
-  results: string[];
-  requestId?: string;
-  request_id?: string;
-  responseTime?: number;
-  response_time?: number;
-  usage?: { credits?: number };
-}
-
-interface CrawlResult {
-  url: string;
-  rawContent?: string;
-  raw_content?: string;
-  images?: string[];
-  favicon?: string;
-}
-
-interface CrawlResponse {
-  baseUrl?: string;
-  base_url?: string;
-  results: CrawlResult[];
-  requestId?: string;
-  request_id?: string;
-  responseTime?: number;
-  response_time?: number;
-  usage?: { credits?: number };
-}
+};
 
 interface ToolMeta {
   requestId?: string;
@@ -110,7 +42,6 @@ interface ToolMeta {
   responseTime?: number;
   fullOutputPath?: string;
   truncation?: TruncationResult;
-  warnings?: string[];
 }
 
 interface SearchDetails extends ToolMeta {
@@ -120,7 +51,7 @@ interface SearchDetails extends ToolMeta {
   topic: SearchTopic;
   hasAnswer: boolean;
   imageCount: number;
-  autoParameters?: Record<string, unknown>;
+  autoParameters?: Partial<TavilySearchOptions>;
 }
 
 interface ExtractDetails extends ToolMeta {
@@ -129,7 +60,7 @@ interface ExtractDetails extends ToolMeta {
   failureCount: number;
   extractDepth: ExtractDepth;
   format: OutputFormat;
-  failed: ExtractFailure[];
+  failed: TavilyExtractResponse["failedResults"];
 }
 
 interface MapDetails extends ToolMeta {
@@ -152,25 +83,42 @@ const SearchParams = Type.Object({
   query: Type.String({ description: "What to search for on the web" }),
   max_results: Type.Optional(
     Type.Number({
-      minimum: 1,
+      minimum: 0,
       maximum: 20,
       description: "Maximum number of results to return",
     }),
   ),
   search_depth: Type.Optional(
-    StringEnum(["basic", "fast", "advanced", "ultra-fast"] as const, {
-      description: "Latency vs relevance tradeoff",
-    }),
+    Type.Union(
+      [
+        Type.Literal("basic"),
+        Type.Literal("fast"),
+        Type.Literal("advanced"),
+        Type.Literal("ultra-fast"),
+      ],
+      { description: "Latency vs relevance tradeoff" },
+    ),
   ),
   topic: Type.Optional(
-    StringEnum(["general", "news", "finance"] as const, {
-      description: "Search topic specialization",
-    }),
+    Type.Union(
+      [Type.Literal("general"), Type.Literal("news"), Type.Literal("finance")],
+      { description: "Search topic specialization" },
+    ),
   ),
   time_range: Type.Optional(
-    StringEnum(["day", "week", "month", "year"] as const, {
-      description: "Relative freshness window",
-    }),
+    Type.Union(
+      [
+        Type.Literal("day"),
+        Type.Literal("week"),
+        Type.Literal("month"),
+        Type.Literal("year"),
+        Type.Literal("d"),
+        Type.Literal("w"),
+        Type.Literal("m"),
+        Type.Literal("y"),
+      ],
+      { description: "Relative freshness window" },
+    ),
   ),
   start_date: Type.Optional(
     Type.String({ description: "Only results after YYYY-MM-DD" }),
@@ -178,20 +126,27 @@ const SearchParams = Type.Object({
   end_date: Type.Optional(
     Type.String({ description: "Only results before YYYY-MM-DD" }),
   ),
+  chunks_per_source: Type.Optional(
+    Type.Number({
+      minimum: 1,
+      maximum: 3,
+      description: "Relevant snippets per result for advanced search",
+    }),
+  ),
   include_answer: Type.Optional(
     Type.Union([
       Type.Boolean({ description: "Whether to include a synthesized answer" }),
-      StringEnum(["none", "basic", "advanced"] as const, {
-        description: "Answer mode. true behaves like basic.",
-      }),
+      Type.Literal("none"),
+      Type.Literal("basic"),
+      Type.Literal("advanced"),
     ]),
   ),
   include_raw_content: Type.Optional(
     Type.Union([
       Type.Boolean({ description: "Whether to include parsed source content" }),
-      StringEnum(["none", "markdown", "text"] as const, {
-        description: "Raw content mode. true behaves like markdown.",
-      }),
+      Type.Literal("none"),
+      Type.Literal("markdown"),
+      Type.Literal("text"),
     ]),
   ),
   include_images: Type.Optional(
@@ -213,11 +168,25 @@ const SearchParams = Type.Object({
   country: Type.Optional(
     Type.String({ description: "Boost results from this country name" }),
   ),
+  auto_parameters: Type.Optional(
+    Type.Boolean({
+      description: "Let the search engine tune search parameters automatically",
+    }),
+  ),
   exact_match: Type.Optional(
     Type.Boolean({ description: "Respect quoted phrases exactly" }),
   ),
   include_favicon: Type.Optional(
     Type.Boolean({ description: "Include favicon URLs" }),
+  ),
+  include_usage: Type.Optional(
+    Type.Boolean({ description: "Include credit usage info" }),
+  ),
+  safe_search: Type.Optional(
+    Type.Boolean({ description: "Filter unsafe content when supported" }),
+  ),
+  timeout: Type.Optional(
+    Type.Number({ minimum: 1, maximum: 60, description: "Timeout in seconds" }),
   ),
 });
 
@@ -228,12 +197,14 @@ const ExtractParams = Type.Object({
     description: "One or more URLs to extract",
   }),
   extract_depth: Type.Optional(
-    StringEnum(["basic", "advanced"] as const, {
+    Type.Union([Type.Literal("basic"), Type.Literal("advanced")], {
       description: "Advanced handles harder pages and embedded content",
     }),
   ),
   format: Type.Optional(
-    StringEnum(["markdown", "text"] as const, { description: "Output format" }),
+    Type.Union([Type.Literal("markdown"), Type.Literal("text")], {
+      description: "Output format",
+    }),
   ),
   query: Type.Optional(
     Type.String({
@@ -252,6 +223,9 @@ const ExtractParams = Type.Object({
   ),
   include_favicon: Type.Optional(
     Type.Boolean({ description: "Include favicon URLs" }),
+  ),
+  include_usage: Type.Optional(
+    Type.Boolean({ description: "Include credit usage info" }),
   ),
   timeout: Type.Optional(
     Type.Number({ minimum: 1, maximum: 60, description: "Timeout in seconds" }),
@@ -302,6 +276,9 @@ const MapParams = Type.Object({
   ),
   allow_external: Type.Optional(
     Type.Boolean({ description: "Include external-domain links" }),
+  ),
+  include_usage: Type.Optional(
+    Type.Boolean({ description: "Include credit usage info" }),
   ),
   timeout: Type.Optional(
     Type.Number({
@@ -367,18 +344,23 @@ const CrawlParams = Type.Object({
     Type.Boolean({ description: "Include external-domain links" }),
   ),
   extract_depth: Type.Optional(
-    StringEnum(["basic", "advanced"] as const, {
+    Type.Union([Type.Literal("basic"), Type.Literal("advanced")], {
       description: "Advanced extracts harder content",
     }),
   ),
   format: Type.Optional(
-    StringEnum(["markdown", "text"] as const, { description: "Output format" }),
+    Type.Union([Type.Literal("markdown"), Type.Literal("text")], {
+      description: "Output format",
+    }),
   ),
   include_images: Type.Optional(
     Type.Boolean({ description: "Include image URLs" }),
   ),
   include_favicon: Type.Optional(
     Type.Boolean({ description: "Include favicon URLs" }),
+  ),
+  include_usage: Type.Optional(
+    Type.Boolean({ description: "Include credit usage info" }),
   ),
   timeout: Type.Optional(
     Type.Number({
@@ -389,30 +371,81 @@ const CrawlParams = Type.Object({
   ),
 });
 
+const HIDDEN_COMPONENT: Component = {
+  render() {
+    return [];
+  },
+  invalidate() {},
+};
+
+function normalizeStringArray(
+  value: unknown,
+  splitCommas = false,
+): string[] | undefined {
+  if (Array.isArray(value)) {
+    const items = value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  const items = value
+    .split(splitCommas ? /[\n,]/ : /\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
+function normalizeAnswerMode(value: unknown): AnswerMode {
+  if (value === true) return "basic";
+  if (value === "basic" || value === "advanced") return value;
+  return false;
+}
+
+function normalizeRawContentMode(value: unknown): RawContentMode {
+  if (value === true) return "markdown";
+  if (value === "markdown" || value === "text") return value;
+  return false;
+}
+
+function formatList(items: string[]): string {
+  return items.map((item) => `- ${item}`).join("\n");
+}
+
+function getString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return typeof record[key] === "string" ? record[key] : undefined;
+}
+
+function getArrayLength(value: unknown, key: string): number | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return Array.isArray(record[key]) ? record[key].length : undefined;
+}
+
 function formatSeconds(value: number | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  return `${value.toFixed(2)}s`;
+  return value === undefined ? undefined : `${value.toFixed(2)}s`;
 }
 
-function getRequestId(response: {
-  requestId?: string;
-  request_id?: string;
-}): string | undefined {
-  return response.requestId ?? response.request_id;
-}
-
-function getResponseTime(response: {
-  responseTime?: number;
-  response_time?: number;
-}): number | undefined {
-  return response.responseTime ?? response.response_time;
-}
-
-function coerceRawContent(result: {
-  rawContent?: string;
-  raw_content?: string;
-}): string {
-  return result.rawContent ?? result.raw_content ?? "";
+function renderMeta(details: ToolMeta, theme: Theme): string {
+  const meta: string[] = [];
+  if (details.requestId)
+    meta.push(theme.fg("dim", `request ${details.requestId}`));
+  if (details.credits !== undefined) {
+    meta.push(
+      theme.fg(
+        "dim",
+        `${details.credits} credit${details.credits === 1 ? "" : "s"}`,
+      ),
+    );
+  }
+  const responseTime = formatSeconds(details.responseTime);
+  if (responseTime) meta.push(theme.fg("dim", responseTime));
+  if (details.fullOutputPath)
+    meta.push(theme.fg("dim", `full JSON: ${details.fullOutputPath}`));
+  return meta.join("  ");
 }
 
 async function writeTempJson(prefix: string, value: unknown): Promise<string> {
@@ -433,200 +466,46 @@ async function buildTextResult(
     maxLines: DEFAULT_MAX_LINES,
     maxBytes: DEFAULT_MAX_BYTES,
   });
-  if (!truncation.truncated) {
-    return { text: truncation.content };
-  }
+  if (!truncation.truncated) return { text: truncation.content };
 
   const fullOutputPath = await writeTempJson(prefix, jsonValue);
-  const resultText =
-    `${truncation.content}\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines ` +
-    `(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). ` +
-    `Full JSON saved to: ${fullOutputPath}]`;
-
-  return { text: resultText, truncation, fullOutputPath };
-}
-
-function listLines(items: string[]): string {
-  return items.map((item) => `- ${item}`).join("\n");
-}
-
-const HIDDEN_COMPONENT: Component = {
-  render() {
-    return [];
-  },
-  invalidate() {},
-};
-
-function getStringProperty(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  return typeof record[key] === "string" ? (record[key] as string) : undefined;
-}
-
-function getArrayLengthProperty(
-  value: unknown,
-  key: string,
-): number | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
-  return Array.isArray(record[key]) ? record[key].length : undefined;
-}
-
-function normalizeStringArray(
-  value: unknown,
-  options?: { splitCommas?: boolean },
-): string[] | undefined {
-  const splitCommas = options?.splitCommas ?? false;
-  if (Array.isArray(value)) {
-    const items = value
-      .filter((item): item is string => typeof item === "string")
-      .map((item) => item.trim())
-      .filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-  if (typeof value === "string") {
-    const items = value
-      .split(splitCommas ? /[\n,]/ : /\n/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-  return undefined;
-}
-
-function normalizeIncludeAnswer(value: unknown): false | "basic" | "advanced" {
-  if (value === true) return "basic";
-  if (value === false || value === undefined || value === "none") return false;
-  if (value === "basic" || value === "advanced") return value;
-  return false;
-}
-
-function normalizeIncludeRawContent(
-  value: unknown,
-): false | "markdown" | "text" {
-  if (value === true) return "markdown";
-  if (value === false || value === undefined || value === "none") return false;
-  if (value === "markdown" || value === "text") return value;
-  return false;
-}
-
-function coerceCommonListArguments<T extends Record<string, unknown>>(
-  args: unknown,
-  keys: Array<keyof T>,
-  options?: { splitCommas?: boolean },
-): T | unknown {
-  if (!args || typeof args !== "object") return args;
-  const input = { ...(args as Record<string, unknown>) };
-  for (const key of keys) {
-    const normalized = normalizeStringArray(input[key as string], options);
-    if (normalized) input[key as string] = normalized;
-  }
-  return input;
-}
-
-function renderMeta(details: ToolMeta, theme: Theme): string {
-  const meta: string[] = [];
-  if (details.requestId)
-    meta.push(theme.fg("dim", `request ${details.requestId}`));
-  if (details.credits !== undefined)
-    meta.push(
-      theme.fg(
-        "dim",
-        `${details.credits} credit${details.credits === 1 ? "" : "s"}`,
-      ),
-    );
-  const responseTime = formatSeconds(details.responseTime);
-  if (responseTime) meta.push(theme.fg("dim", responseTime));
-  if (details.fullOutputPath)
-    meta.push(theme.fg("dim", `full JSON: ${details.fullOutputPath}`));
-  return meta.join("  ");
-}
-
-function createClient() {
-  const apiKey = process.env.TAVILY_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "Missing TAVILY_API_KEY. Export your Tavily API key before using web tools.",
-    );
-  }
-
-  const projectId = process.env.TAVILY_PROJECT;
   return {
-    apiKey,
-    projectId,
+    text:
+      `${truncation.content}\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines ` +
+      `(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). ` +
+      `Full JSON saved to: ${fullOutputPath}]`,
+    truncation,
+    fullOutputPath,
   };
 }
 
-async function postTavily<T>(
-  endpoint: string,
-  body: Record<string, unknown>,
-  signal: AbortSignal | undefined,
-  timeoutSeconds = 60,
-): Promise<T> {
-  const client = createClient();
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${client.apiKey}`,
-    "Content-Type": "application/json",
-    "X-Client-Source": "pi-web-tools",
-  };
-  if (client.projectId) headers["X-Project-ID"] = client.projectId;
-
-  const timeoutSignal = AbortSignal.timeout(timeoutSeconds * 1000);
-  const requestSignal = signal
-    ? AbortSignal.any([signal, timeoutSignal])
-    : timeoutSignal;
-
-  let response: Response;
-  try {
-    response = await fetch(`https://api.tavily.com/${endpoint}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: requestSignal,
-    });
-  } catch (error) {
-    if (timeoutSignal.aborted && !signal?.aborted) {
-      throw new Error(`Request timed out after ${timeoutSeconds} seconds.`);
-    }
-    throw error;
-  }
-
-  if (!response.ok) {
-    const responseText = await response.text();
-    let message = responseText;
-    try {
-      const parsed = JSON.parse(responseText) as {
-        detail?: { error?: string };
-      };
-      message = parsed.detail?.error ?? responseText;
-    } catch {
-      // Keep raw response text when not JSON.
-    }
-    throw new Error(
-      message || `Tavily ${endpoint} failed (${response.status})`,
-    );
-  }
-
-  return (await response.json()) as T;
+function createClient(): TavilyClient | undefined {
+  const apiKey = process.env.TAVILY_API_KEY;
+  if (!apiKey) return undefined;
+  return tavily({
+    apiKey,
+    projectId: process.env.TAVILY_PROJECT,
+    clientSource: "web-tools",
+  });
 }
 
 export default function webToolsExtension(pi: ExtensionAPI) {
-  const hasApiKey = Boolean(process.env.TAVILY_API_KEY);
+  const client = createClient();
 
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.setStatus(
       "web-tools",
-      hasApiKey ? undefined : "web tools unavailable: set TAVILY_API_KEY",
+      client ? undefined : "web tools unavailable: missing API key",
     );
   });
 
-  if (!hasApiKey) return;
+  if (!client) return;
 
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the live web with LLM-optimized ranking and optional extracted snippets. Best for discovery, current information, and finding candidate URLs before extraction.",
+      "Search the live web with ranked results and optional extracted snippets. Best for discovery, current information, and finding candidate URLs before extraction.",
     promptSnippet:
       "Search the live web for current information or to find relevant URLs before extracting content.",
     promptGuidelines: [
@@ -636,88 +515,85 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: SearchParams,
     prepareArguments(args) {
-      const normalized = coerceCommonListArguments(
-        args,
-        ["include_domains", "exclude_domains"],
-        { splitCommas: true },
-      );
-      if (!normalized || typeof normalized !== "object") return normalized;
-      const input = { ...(normalized as Record<string, unknown>) };
-      if ("include_answer" in input) {
-        input.include_answer = normalizeIncludeAnswer(input.include_answer);
-      }
+      if (!args || typeof args !== "object") return args;
+      const input = { ...(args as Record<string, unknown>) };
+      const includeDomains = normalizeStringArray(input.include_domains, true);
+      const excludeDomains = normalizeStringArray(input.exclude_domains, true);
+      if (includeDomains) input.include_domains = includeDomains;
+      if (excludeDomains) input.exclude_domains = excludeDomains;
+      if ("include_answer" in input)
+        input.include_answer = normalizeAnswerMode(input.include_answer);
       if ("include_raw_content" in input) {
-        input.include_raw_content = normalizeIncludeRawContent(
+        input.include_raw_content = normalizeRawContentMode(
           input.include_raw_content,
         );
       }
       return input;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params) {
       const searchDepth = params.search_depth ?? "basic";
       const topic = params.topic ?? "general";
-      const response = await postTavily<SearchResponse>(
-        "search",
-        {
-          query: params.query,
-          max_results: params.max_results,
-          search_depth: searchDepth,
-          topic,
-          time_range: params.time_range,
-          start_date: params.start_date,
-          end_date: params.end_date,
-          include_answer: normalizeIncludeAnswer(params.include_answer),
-          include_raw_content: normalizeIncludeRawContent(
-            params.include_raw_content,
-          ),
-          include_images: params.include_images,
-          include_image_descriptions: params.include_image_descriptions,
-          include_domains: params.include_domains,
-          exclude_domains: params.exclude_domains,
-          country: params.country,
-          exact_match: params.exact_match,
-          include_favicon: params.include_favicon,
-          include_usage: true,
-        },
-        signal,
-        60,
-      );
+      const response = await client.search(params.query, {
+        searchDepth,
+        topic,
+        maxResults: params.max_results,
+        timeRange: params.time_range,
+        startDate: params.start_date,
+        endDate: params.end_date,
+        chunksPerSource: params.chunks_per_source,
+        includeAnswer: normalizeAnswerMode(params.include_answer),
+        includeRawContent: normalizeRawContentMode(params.include_raw_content),
+        includeImages: params.include_images,
+        includeImageDescriptions: params.include_image_descriptions,
+        includeDomains: params.include_domains,
+        excludeDomains: params.exclude_domains,
+        country: params.country,
+        autoParameters: params.auto_parameters,
+        exactMatch: params.exact_match,
+        includeFavicon: params.include_favicon,
+        includeUsage: params.include_usage ?? true,
+        safe_search: params.safe_search,
+        timeout: params.timeout,
+      });
 
       const lines: string[] = [];
-      if (response.answer) {
-        lines.push("Answer:");
-        lines.push(response.answer);
-        lines.push("");
-      }
+      if (response.answer) lines.push("Answer:", response.answer, "");
 
       lines.push(
         `Found ${response.results.length} result${response.results.length === 1 ? "" : "s"} for: ${response.query}`,
       );
-      for (const [index, result] of response.results.entries()) {
-        lines.push("");
-        lines.push(`${index + 1}. ${result.title}`);
-        lines.push(`URL: ${result.url}`);
-        lines.push(`Score: ${result.score.toFixed(3)}`);
+      for (const [index, rawResult] of response.results.entries()) {
+        const result = rawResult as SearchResultWithImages;
+        lines.push(
+          "",
+          `${index + 1}. ${result.title}`,
+          `URL: ${result.url}`,
+          `Score: ${result.score.toFixed(3)}`,
+        );
         if (result.publishedDate)
           lines.push(`Published: ${result.publishedDate}`);
         if (result.favicon) lines.push(`Favicon: ${result.favicon}`);
         lines.push(result.content);
-        if (result.rawContent) {
-          lines.push("");
-          lines.push("Raw content:");
-          lines.push(result.rawContent);
+        if (result.rawContent)
+          lines.push("", "Raw content:", result.rawContent);
+        if (result.images && result.images.length > 0) {
+          lines.push("", "Result images:");
+          for (const image of result.images) {
+            lines.push(
+              typeof image === "string"
+                ? `- ${image}`
+                : `- ${image.url}${image.description ? ` :: ${image.description}` : ""}`,
+            );
+          }
         }
       }
 
-      if (response.images && response.images.length > 0) {
-        lines.push("");
-        lines.push("Images:");
+      if (response.images.length > 0) {
+        lines.push("", "Images:");
         for (const image of response.images) {
-          if (typeof image === "string") lines.push(`- ${image}`);
-          else
-            lines.push(
-              `- ${image.url}${image.description ? ` :: ${image.description}` : ""}`,
-            );
+          lines.push(
+            `- ${image.url}${image.description ? ` :: ${image.description}` : ""}`,
+          );
         }
       }
 
@@ -734,11 +610,11 @@ export default function webToolsExtension(pi: ExtensionAPI) {
           searchDepth,
           topic,
           hasAnswer: Boolean(response.answer),
-          imageCount: response.images?.length ?? 0,
-          requestId: getRequestId(response),
-          responseTime: getResponseTime(response),
+          imageCount: response.images.length,
+          requestId: response.requestId,
+          responseTime: response.responseTime,
           credits: response.usage?.credits,
-          autoParameters: response.autoParameters ?? response.auto_parameters,
+          autoParameters: response.autoParameters,
           fullOutputPath: built.fullOutputPath,
           truncation: built.truncation,
         } as SearchDetails,
@@ -747,24 +623,20 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_search "));
-      const query = getStringProperty(args, "query");
-      text += theme.fg("accent", query ? JSON.stringify(query) : "");
-      const topic = getStringProperty(args, "topic");
+      text += theme.fg(
+        "accent",
+        JSON.stringify(getString(args, "query") ?? ""),
+      );
+      const topic = getString(args, "topic");
+      const searchDepth = getString(args, "search_depth");
       if (topic) text += theme.fg("dim", ` ${topic}`);
-      const searchDepth = getStringProperty(args, "search_depth");
       if (searchDepth) text += theme.fg("dim", ` ${searchDepth}`);
       return new Text(text, 0, 0);
     },
     renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as SearchDetails | undefined;
-      if (
-        !details ||
-        typeof details.resultCount !== "number" ||
-        typeof details.query !== "string"
-      ) {
-        return HIDDEN_COMPONENT;
-      }
+      if (!details) return HIDDEN_COMPONENT;
       let text = theme.fg(
         "success",
         `${details.resultCount} result${details.resultCount === 1 ? "" : "s"}`,
@@ -794,50 +666,39 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     prepareArguments(args) {
       if (!args || typeof args !== "object") return args;
       const input = { ...(args as Record<string, unknown>) };
-      const urls = normalizeStringArray(input.urls, { splitCommas: true });
+      const urls = normalizeStringArray(input.urls, true);
       if (urls) input.urls = urls;
       return input;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params) {
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = await postTavily<ExtractResponse>(
-        "extract",
-        {
-          urls: params.urls,
-          extract_depth: extractDepth,
-          format,
-          query: params.query,
-          chunks_per_source: params.chunks_per_source,
-          include_images: params.include_images,
-          include_favicon: params.include_favicon,
-          timeout: params.timeout,
-          include_usage: true,
-        },
-        signal,
-        params.timeout ?? 30,
-      );
+      const response = await client.extract(params.urls, {
+        extractDepth,
+        format,
+        query: params.query,
+        chunksPerSource: params.chunks_per_source,
+        includeImages: params.include_images,
+        includeFavicon: params.include_favicon,
+        includeUsage: params.include_usage ?? true,
+        timeout: params.timeout,
+      } satisfies TavilyExtractOptions);
 
-      const failed = response.failedResults ?? response.failed_results ?? [];
       const lines: string[] = [
         `Extracted ${response.results.length} of ${params.urls.length} URL${params.urls.length === 1 ? "" : "s"}.`,
       ];
       for (const result of response.results) {
-        lines.push("");
-        lines.push(`URL: ${result.url}`);
+        lines.push("", `URL: ${result.url}`);
         if (result.favicon) lines.push(`Favicon: ${result.favicon}`);
-        const rawContent = coerceRawContent(result);
-        lines.push(rawContent || "(No content returned)");
+        lines.push(result.rawContent || "(No content returned)");
         if (result.images && result.images.length > 0) {
-          lines.push("");
-          lines.push("Images:");
-          lines.push(listLines(result.images));
+          lines.push("", "Images:", formatList(result.images));
         }
       }
-      if (failed.length > 0) {
-        lines.push("");
-        lines.push("Failed:");
-        for (const item of failed) lines.push(`- ${item.url} :: ${item.error}`);
+      if (response.failedResults.length > 0) {
+        lines.push("", "Failed:");
+        for (const item of response.failedResults)
+          lines.push(`- ${item.url} :: ${item.error}`);
       }
 
       const built = await buildTextResult(
@@ -850,12 +711,12 @@ export default function webToolsExtension(pi: ExtensionAPI) {
         details: {
           urlCount: params.urls.length,
           successCount: response.results.length,
-          failureCount: failed.length,
+          failureCount: response.failedResults.length,
           extractDepth,
           format,
-          failed,
-          requestId: getRequestId(response),
-          responseTime: getResponseTime(response),
+          failed: response.failedResults,
+          requestId: response.requestId,
+          responseTime: response.responseTime,
           credits: response.usage?.credits,
           fullOutputPath: built.fullOutputPath,
           truncation: built.truncation,
@@ -865,27 +726,21 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_extract "));
-      const urlCount = getArrayLengthProperty(args, "urls");
+      const urlCount = getArrayLength(args, "urls");
       text += theme.fg(
         "accent",
         urlCount === undefined
           ? ""
           : `${urlCount} URL${urlCount === 1 ? "" : "s"}`,
       );
-      const query = getStringProperty(args, "query");
+      const query = getString(args, "query");
       if (query) text += theme.fg("dim", ` query=${JSON.stringify(query)}`);
       return new Text(text, 0, 0);
     },
     renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as ExtractDetails | undefined;
-      if (
-        !details ||
-        typeof details.successCount !== "number" ||
-        typeof details.urlCount !== "number"
-      ) {
-        return HIDDEN_COMPONENT;
-      }
+      if (!details) return HIDDEN_COMPONENT;
       let text = theme.fg(
         "success",
         `${details.successCount}/${details.urlCount} extracted`,
@@ -895,9 +750,8 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       const meta = renderMeta(details, theme);
       if (meta) text += `\n${meta}`;
       if (expanded && details.failed.length > 0) {
-        for (const item of details.failed) {
+        for (const item of details.failed)
           text += `\n${theme.fg("error", `${item.url} :: ${item.error}`)}`;
-        }
       }
       return new Text(text, 0, 0);
     },
@@ -916,57 +770,56 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: MapParams,
     prepareArguments(args) {
-      return coerceCommonListArguments(args, [
+      if (!args || typeof args !== "object") return args;
+      const input = { ...(args as Record<string, unknown>) };
+      for (const key of [
         "select_paths",
         "exclude_paths",
         "select_domains",
         "exclude_domains",
-      ]);
+      ] as const) {
+        const values = normalizeStringArray(input[key]);
+        if (values) input[key] = values;
+      }
+      return input;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
-      const response = await postTavily<MapResponse>(
-        "map",
-        {
-          url: params.url,
-          max_depth: maxDepth,
-          max_breadth: params.max_breadth,
-          limit,
-          instructions: params.instructions,
-          select_paths: params.select_paths,
-          exclude_paths: params.exclude_paths,
-          select_domains: params.select_domains,
-          exclude_domains: params.exclude_domains,
-          allow_external: params.allow_external,
-          timeout: params.timeout,
-          include_usage: true,
-        },
-        signal,
-        params.timeout ?? 150,
-      );
-
-      const lines = [
-        `Mapped ${response.baseUrl ?? response.base_url ?? params.url}`,
-        `Discovered ${response.results.length} URL${response.results.length === 1 ? "" : "s"}.`,
-        "",
-        ...response.results.map((url, index) => `${index + 1}. ${url}`),
-      ];
+      const response = await client.map(params.url, {
+        maxDepth,
+        maxBreadth: params.max_breadth,
+        limit,
+        instructions: params.instructions,
+        selectPaths: params.select_paths,
+        excludePaths: params.exclude_paths,
+        selectDomains: params.select_domains,
+        excludeDomains: params.exclude_domains,
+        allowExternal: params.allow_external,
+        includeUsage: params.include_usage ?? true,
+        timeout: params.timeout,
+      } satisfies TavilyMapOptions);
 
       const built = await buildTextResult(
         "pi-web-map",
-        lines.join("\n"),
+        [
+          `Mapped ${response.baseUrl}`,
+          `Discovered ${response.results.length} URL${response.results.length === 1 ? "" : "s"}.`,
+          "",
+          ...response.results.map((url, index) => `${index + 1}. ${url}`),
+        ].join("\n"),
         response,
       );
+
       return {
         content: [{ type: "text", text: built.text }],
         details: {
-          url: response.baseUrl ?? response.base_url ?? params.url,
+          url: response.baseUrl,
           resultCount: response.results.length,
           maxDepth,
           limit,
-          requestId: getRequestId(response),
-          responseTime: getResponseTime(response),
+          requestId: response.requestId,
+          responseTime: response.responseTime,
           credits: response.usage?.credits,
           fullOutputPath: built.fullOutputPath,
           truncation: built.truncation,
@@ -976,22 +829,14 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_map "));
-      const url = getStringProperty(args, "url");
-      text += theme.fg("accent", url ?? "");
-      if (getStringProperty(args, "instructions"))
-        text += theme.fg("dim", " guided");
+      text += theme.fg("accent", getString(args, "url") ?? "");
+      if (getString(args, "instructions")) text += theme.fg("dim", " guided");
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as MapDetails | undefined;
-      if (
-        !details ||
-        typeof details.resultCount !== "number" ||
-        typeof details.url !== "string"
-      ) {
-        return HIDDEN_COMPONENT;
-      }
+      if (!details) return HIDDEN_COMPONENT;
       let text = theme.fg(
         "success",
         `${details.resultCount} URL${details.resultCount === 1 ? "" : "s"} discovered`,
@@ -1016,57 +861,53 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: CrawlParams,
     prepareArguments(args) {
-      return coerceCommonListArguments(args, [
+      if (!args || typeof args !== "object") return args;
+      const input = { ...(args as Record<string, unknown>) };
+      for (const key of [
         "select_paths",
         "exclude_paths",
         "select_domains",
         "exclude_domains",
-      ]);
+      ] as const) {
+        const values = normalizeStringArray(input[key]);
+        if (values) input[key] = values;
+      }
+      return input;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params) {
       const maxDepth = params.max_depth ?? 1;
       const limit = params.limit ?? 50;
       const extractDepth = params.extract_depth ?? "basic";
       const format = params.format ?? "markdown";
-      const response = await postTavily<CrawlResponse>(
-        "crawl",
-        {
-          url: params.url,
-          max_depth: maxDepth,
-          max_breadth: params.max_breadth,
-          limit,
-          instructions: params.instructions,
-          chunks_per_source: params.chunks_per_source,
-          select_paths: params.select_paths,
-          exclude_paths: params.exclude_paths,
-          select_domains: params.select_domains,
-          exclude_domains: params.exclude_domains,
-          allow_external: params.allow_external,
-          extract_depth: extractDepth,
-          format,
-          include_images: params.include_images,
-          include_favicon: params.include_favicon,
-          timeout: params.timeout,
-          include_usage: true,
-        },
-        signal,
-        params.timeout ?? 150,
-      );
+      const response = await client.crawl(params.url, {
+        maxDepth,
+        maxBreadth: params.max_breadth,
+        limit,
+        instructions: params.instructions,
+        chunksPerSource: params.chunks_per_source,
+        selectPaths: params.select_paths,
+        excludePaths: params.exclude_paths,
+        selectDomains: params.select_domains,
+        excludeDomains: params.exclude_domains,
+        allowExternal: params.allow_external,
+        extractDepth,
+        format,
+        includeImages: params.include_images,
+        includeFavicon: params.include_favicon,
+        includeUsage: params.include_usage ?? true,
+        timeout: params.timeout,
+      } satisfies TavilyCrawlOptions);
 
       const lines: string[] = [
-        `Crawled ${response.baseUrl ?? response.base_url ?? params.url}`,
+        `Crawled ${response.baseUrl}`,
         `Collected ${response.results.length} page${response.results.length === 1 ? "" : "s"}.`,
       ];
       for (const [index, item] of response.results.entries()) {
-        lines.push("");
-        lines.push(`${index + 1}. ${item.url}`);
+        const images = item.images ?? [];
+        lines.push("", `${index + 1}. ${item.url}`);
         if (item.favicon) lines.push(`Favicon: ${item.favicon}`);
-        lines.push(coerceRawContent(item) || "(No content returned)");
-        if (item.images && item.images.length > 0) {
-          lines.push("");
-          lines.push("Images:");
-          lines.push(listLines(item.images));
-        }
+        lines.push(item.rawContent || "(No content returned)");
+        if (images.length > 0) lines.push("", "Images:", formatList(images));
       }
 
       const built = await buildTextResult(
@@ -1077,14 +918,14 @@ export default function webToolsExtension(pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: built.text }],
         details: {
-          url: response.baseUrl ?? response.base_url ?? params.url,
+          url: response.baseUrl,
           pageCount: response.results.length,
           maxDepth,
           limit,
           extractDepth,
           format,
-          requestId: getRequestId(response),
-          responseTime: getResponseTime(response),
+          requestId: response.requestId,
+          responseTime: response.responseTime,
           credits: response.usage?.credits,
           fullOutputPath: built.fullOutputPath,
           truncation: built.truncation,
@@ -1094,22 +935,14 @@ export default function webToolsExtension(pi: ExtensionAPI) {
     renderCall(args, theme, context) {
       if (!context.argsComplete) return HIDDEN_COMPONENT;
       let text = theme.fg("toolTitle", theme.bold("web_crawl "));
-      const url = getStringProperty(args, "url");
-      text += theme.fg("accent", url ?? "");
-      if (getStringProperty(args, "instructions"))
-        text += theme.fg("dim", " guided");
+      text += theme.fg("accent", getString(args, "url") ?? "");
+      if (getString(args, "instructions")) text += theme.fg("dim", " guided");
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return HIDDEN_COMPONENT;
       const details = result.details as CrawlDetails | undefined;
-      if (
-        !details ||
-        typeof details.pageCount !== "number" ||
-        typeof details.url !== "string"
-      ) {
-        return HIDDEN_COMPONENT;
-      }
+      if (!details) return HIDDEN_COMPONENT;
       let text = theme.fg(
         "success",
         `${details.pageCount} page${details.pageCount === 1 ? "" : "s"} collected`,
