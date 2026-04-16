@@ -26,16 +26,19 @@ import {
   type TodoItem,
 } from "./utils.js";
 
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const NORMAL_MODE_TOOLS = [
-  "read",
-  "bash",
-  "edit",
-  "write",
-  "grep",
-  "find",
-  "ls",
-];
+// Tools that mutate files or state — blocked in plan mode.
+const BLOCKED_TOOL_NAMES = new Set(["edit", "write"]);
+
+function getPlanModeTools(pi: ExtensionAPI): string[] {
+  return pi
+    .getAllTools()
+    .filter((t) => !BLOCKED_TOOL_NAMES.has(t.name))
+    .map((t) => t.name);
+}
+
+function getAllToolNames(pi: ExtensionAPI): string[] {
+  return pi.getAllTools().map((t) => t.name);
+}
 
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
   return m.role === "assistant" && Array.isArray(m.content);
@@ -94,10 +97,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
     todoItems = [];
 
     if (planModeEnabled) {
-      pi.setActiveTools(PLAN_MODE_TOOLS);
-      ctx.ui.notify(`Plan mode enabled. Tools: ${PLAN_MODE_TOOLS.join(", ")}`);
+      pi.setActiveTools(getPlanModeTools(pi));
+      ctx.ui.notify("Plan mode enabled. Mutation tools disabled.");
     } else {
-      pi.setActiveTools(NORMAL_MODE_TOOLS);
+      pi.setActiveTools(getAllToolNames(pi));
       ctx.ui.notify("Plan mode disabled. Full access restored.");
     }
     updateStatus(ctx);
@@ -247,7 +250,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
         );
         executionMode = false;
         todoItems = [];
-        pi.setActiveTools(NORMAL_MODE_TOOLS);
+        pi.setActiveTools(getAllToolNames(pi));
         updateStatus(ctx);
         persistState();
       }
@@ -291,7 +294,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
     if (choice?.startsWith("Execute")) {
       planModeEnabled = false;
       executionMode = todoItems.length > 0;
-      pi.setActiveTools(NORMAL_MODE_TOOLS);
+      pi.setActiveTools(getAllToolNames(pi));
       updateStatus(ctx);
 
       const execMessage =
@@ -363,7 +366,7 @@ After completing a step, include a [DONE:n] tag in your response.`,
     }
 
     if (planModeEnabled) {
-      pi.setActiveTools(PLAN_MODE_TOOLS);
+      pi.setActiveTools(getPlanModeTools(pi));
     }
     updateStatus(ctx);
   });
