@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.67.3",
+  "lastChangelogVersion": "0.67.5",
   "defaultProvider": "zai",
   "defaultModel": "glm-5-turbo",
   "defaultThinkingLevel": "medium",
