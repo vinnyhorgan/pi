@@ -1,12 +1,14 @@
 {
   "lastChangelogVersion": "0.67.3",
-  "defaultProvider": "google-antigravity",
-  "defaultModel": "gemini-3-flash",
+  "defaultProvider": "zai",
+  "defaultModel": "glm-5-turbo",
   "defaultThinkingLevel": "medium",
   "enabledModels": [
     "openai-codex/gpt-5.4-mini",
     "openai-codex/gpt-5.4",
     "google-gemini-cli/gemini-2.5-flash",
-    "google-antigravity/gemini-3-flash"
+    "google-antigravity/gemini-3-flash",
+    "zai/glm-5.1",
+    "zai/glm-5-turbo"
   ]
 }

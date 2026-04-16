@@ -1,6 +1,7 @@
 # pi runtime state
 agent/auth.json
 agent/oauth.json
+agent/models.json
 agent/sessions/
 agent/bin/
 agent/tools/
