@@ -22,6 +22,7 @@ This repository is the user's personal configuration and extension workspace for
 - Shape `pi` into the user's ideal daily driver for agentic coding work.
 - Optimize for real usage, not demos.
 - Keep features polished enough for heavy personal use.
+- Main coding focus in this repo: pure C programming. Web dev and scripting stay secondary; assume C-first framing when discussing work here.
 
 ## Current State
 
