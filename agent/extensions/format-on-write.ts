@@ -7,11 +7,13 @@
  * Rules:
  * - `.c` and `.h` use `clang-format` from PATH
  * - Prettier-supported files use `prettier` from PATH
- * - Files not handled by either formatter get `.editorconfig` whitespace rules only
+ * - Files not handled by either formatter get safe `.editorconfig` whitespace normalization only
  * - Formatter failures fall back to raw/editorconfig output instead of breaking tool calls
  *
  * `.editorconfig` does NOT post-process files already handled by clang-format or
- * Prettier. It only applies to non-auto-formatted files.
+ * Prettier. It only applies to non-auto-formatted files, and only for safe
+ * whitespace rules (`trim_trailing_whitespace`, `insert_final_newline`,
+ * `end_of_line`) so extension does not silently break syntax-sensitive files.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -63,7 +65,6 @@ type PrettierSupport = { supported: boolean; skippedReason?: string };
 const C_EXTENSIONS = new Set([".c", ".h"]);
 const CLANG_FORMAT_CONFIG_FILES = [".clang-format", "_clang-format"];
 const FORMATTER_TIMEOUT_MS = 10_000;
-const DEFAULT_TAB_WIDTH = 4;
 
 // ---------------------------------------------------------------------------
 // Per-session state
@@ -524,55 +525,19 @@ async function formatWithPrettier(
 // EditorConfig application
 // ---------------------------------------------------------------------------
 
-function getEditorConfigIndentWidth(config: EditorConfig): number | undefined {
-  if (config.indent_size === "tab") return config.tab_width;
-  if (typeof config.indent_size === "number") return config.indent_size;
-  return config.tab_width;
-}
-
-function getVisualIndentColumns(text: string, tabWidth: number): number {
-  let columns = 0;
-  for (const ch of text) {
-    if (ch === " ") {
-      columns++;
-    } else if (ch === "\t") {
-      const remainder = columns % tabWidth;
-      columns += remainder === 0 ? tabWidth : tabWidth - remainder;
-    } else {
-      break;
-    }
-  }
-  return columns;
-}
-
-function normalizeLeadingIndentation(
+function detectExistingLineEnding(
   text: string,
-  config: EditorConfig,
-): { text: string; applied: boolean } {
-  if (!config.indent_style) return { text, applied: false };
+): EditorConfig["end_of_line"] | undefined {
+  const firstCrLf = text.indexOf("\r\n");
+  if (firstCrLf !== -1) return "crlf";
 
-  const tabWidth =
-    config.tab_width ?? getEditorConfigIndentWidth(config) ?? DEFAULT_TAB_WIDTH;
-  const indentWidth = getEditorConfigIndentWidth(config) ?? tabWidth;
-  let applied = false;
+  const firstCr = text.indexOf("\r");
+  if (firstCr !== -1) return "cr";
 
-  const next = text.replace(/^[ \t]+/gm, (leading) => {
-    const columns = getVisualIndentColumns(leading, tabWidth);
-    let normalized: string;
+  const firstLf = text.indexOf("\n");
+  if (firstLf !== -1) return "lf";
 
-    if (config.indent_style === "space") {
-      normalized = " ".repeat(columns);
-    } else {
-      const tabs = Math.floor(columns / indentWidth);
-      const spaces = columns % indentWidth;
-      normalized = "\t".repeat(tabs) + " ".repeat(spaces);
-    }
-
-    if (normalized !== leading) applied = true;
-    return normalized;
-  });
-
-  return { text: next, applied };
+  return undefined;
 }
 
 function applyEditorConfigRules(
@@ -582,18 +547,15 @@ function applyEditorConfigRules(
   let next = text;
   let applied = false;
 
-  const indentResult = normalizeLeadingIndentation(next, config);
-  next = indentResult.text;
-  applied = applied || indentResult.applied;
-
   if (config.trim_trailing_whitespace === true) {
     const trimmed = next.replace(/[ \t]+$/gm, "");
     applied = applied || trimmed !== next;
     next = trimmed;
   }
 
-  if (config.end_of_line) {
-    const withLineEndings = applyLineEnding(next, config.end_of_line);
+  const targetLineEnding = config.end_of_line ?? detectExistingLineEnding(next);
+  if (targetLineEnding) {
+    const withLineEndings = applyLineEnding(next, targetLineEnding);
     applied = applied || withLineEndings !== next;
     next = withLineEndings;
   }
@@ -604,9 +566,9 @@ function applyEditorConfigRules(
     !next.endsWith("\r")
   ) {
     next +=
-      config.end_of_line === "crlf"
+      targetLineEnding === "crlf"
         ? "\r\n"
-        : config.end_of_line === "cr"
+        : targetLineEnding === "cr"
           ? "\r"
           : "\n";
     applied = true;
@@ -678,11 +640,20 @@ async function formatText(
   return applyEditorconfigFallback(support.skippedReason);
 }
 
+function splitBom(text: string): { bom: string; text: string } {
+  if (text.startsWith("\uFEFF")) {
+    return { bom: "\uFEFF", text: text.slice(1) };
+  }
+  return { bom: "", text };
+}
+
 async function formatFileInPlace(filePath: string): Promise<FormatOutcome> {
-  const before = await readFile(filePath, "utf8");
+  const rawBefore = await readFile(filePath, "utf8");
+  const { bom, text: before } = splitBom(rawBefore);
   const result = await formatText(filePath, before);
-  if (result.text !== before) {
-    await writeFile(filePath, result.text, "utf8");
+  const rawAfter = bom + result.text;
+  if (rawAfter !== rawBefore) {
+    await writeFile(filePath, rawAfter, "utf8");
   }
   return result.outcome;
 }
