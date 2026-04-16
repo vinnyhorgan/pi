@@ -1,25 +1,26 @@
 /**
  * Format on Write Extension
  *
- * Overrides built-in `edit` and `write` so touched files are normalized
- * automatically after each mutation.
+ * Overrides built-in `edit` and `write` so touched files are normalized after
+ * each mutation without changing core pi behavior.
  *
  * Rules:
  * - `.c` and `.h` use `clang-format` from PATH
  *   - if `.clang-format`/`_clang-format` exists, use it
- *   - otherwise use deterministic clang-format default style (`LLVM`)
- * - Prettier-supported files use `prettier` from PATH with default Prettier behavior only
- *   - ignore project Prettier config
- *   - ignore `.editorconfig`
- * - Files not handled by either formatter get safe `.editorconfig` whitespace normalization only
- * - Formatter failures never break tool calls
- *   - clang-format / Prettier failures keep raw content unchanged
- *   - `.editorconfig` fallback only applies to files not handled by clang-format or Prettier
+ *   - otherwise use deterministic fallback style (`LLVM`)
+ * - Prettier-supported files use `prettier` from PATH
+ *   - honors normal Prettier config and EditorConfig resolution
+ *   - intentionally ignores `.prettierignore` so touched supported files are
+ *     always formatted
+ * - Files not handled by either formatter get safe `.editorconfig` whitespace
+ *   normalization only
+ * - Formatter failures never break `edit` / `write`
  *
- * `.editorconfig` has ZERO effect on files already handled by clang-format or
- * Prettier. It only applies to non-auto-formatted files, and only for safe
- * whitespace rules (`trim_trailing_whitespace`, `insert_final_newline`,
- * `end_of_line`) so extension does not silently break syntax-sensitive files.
+ * `.editorconfig` fallback only applies to files not handled by clang-format or
+ * Prettier, and only for safe whitespace rules:
+ * - `trim_trailing_whitespace`
+ * - `insert_final_newline`
+ * - `end_of_line`
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -64,6 +65,12 @@ type FormatOutcome = {
 
 type PrettierSupport = { supported: boolean; skippedReason?: string };
 
+type ToolCallStore = {
+  toolCallId: string;
+  cwd: string;
+  signal?: AbortSignal;
+};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -71,21 +78,36 @@ type PrettierSupport = { supported: boolean; skippedReason?: string };
 const C_EXTENSIONS = new Set([".c", ".h"]);
 const CLANG_FORMAT_CONFIG_FILES = [".clang-format", "_clang-format"];
 const FORMATTER_TIMEOUT_MS = 10_000;
+const NULL_IGNORE_PATH = "/dev/null";
+const FORMAT_ON_WRITE_SENTINEL = Symbol.for("pi.format-on-write.loaded");
 
 // ---------------------------------------------------------------------------
 // Per-session state
 // ---------------------------------------------------------------------------
 
-const toolCallContext = new AsyncLocalStorage<{
-  toolCallId: string;
-  signal?: AbortSignal;
-}>();
+const toolCallContext = new AsyncLocalStorage<ToolCallStore>();
 const formatResults = new Map<string, FormatOutcome>();
 const prettierSupportCache = new Map<string, Promise<PrettierSupport>>();
 
 function clearFormattingState(): void {
   formatResults.clear();
   prettierSupportCache.clear();
+}
+
+function claimExtensionInstance(): boolean {
+  const state = globalThis as typeof globalThis & {
+    [FORMAT_ON_WRITE_SENTINEL]?: boolean;
+  };
+  if (state[FORMAT_ON_WRITE_SENTINEL]) return false;
+  state[FORMAT_ON_WRITE_SENTINEL] = true;
+  return true;
+}
+
+function releaseExtensionInstance(): void {
+  const state = globalThis as typeof globalThis & {
+    [FORMAT_ON_WRITE_SENTINEL]?: boolean;
+  };
+  delete state[FORMAT_ON_WRITE_SENTINEL];
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +121,18 @@ function getExtension(filePath: string): string {
 
 function isCFile(filePath: string): boolean {
   return C_EXTENSIONS.has(getExtension(filePath));
+}
+
+function isWithinRoot(root: string, target: string): boolean {
+  const rel = relative(resolve(root), resolve(target));
+  return (
+    rel === "" ||
+    (rel !== ".." &&
+      !rel.startsWith("../") &&
+      !rel.startsWith("..\\") &&
+      !rel.startsWith("/") &&
+      !rel.startsWith("\\"))
+  );
 }
 
 async function exists(filePath: string): Promise<boolean> {
@@ -126,7 +160,7 @@ async function findUpWithinCwd(
   const root = resolve(cwd);
   let current = resolve(startDir);
 
-  if (relative(root, current).startsWith("..")) return undefined;
+  if (!isWithinRoot(root, current)) return undefined;
 
   for (;;) {
     for (const name of names) {
@@ -135,9 +169,8 @@ async function findUpWithinCwd(
     }
     if (current === root) return undefined;
     const parent = dirname(current);
-    if (parent === current) return undefined;
+    if (parent === current || !isWithinRoot(root, parent)) return undefined;
     current = parent;
-    if (relative(root, current).startsWith("..")) return undefined;
   }
 }
 
@@ -181,6 +214,13 @@ function summarizeError(error: unknown): string {
       .find((line) => line.trim().length > 0)
       ?.trim() ?? "unknown error"
   );
+}
+
+function splitBom(text: string): { bom: string; text: string } {
+  if (text.startsWith("\uFEFF")) {
+    return { bom: "\uFEFF", text: text.slice(1) };
+  }
+  return { bom: "", text };
 }
 
 // ---------------------------------------------------------------------------
@@ -233,8 +273,9 @@ function expandBraces(pattern: string): string[] {
         const to = Number(numeric[2]);
         const step = from <= to ? 1 : -1;
         const out: string[] = [];
-        for (let n = from; step > 0 ? n <= to : n >= to; n += step)
+        for (let n = from; step > 0 ? n <= to : n >= to; n += step) {
           out.push(String(n));
+        }
         return out;
       })()
     : splitTopLevelComma(body);
@@ -260,7 +301,9 @@ function globToRegexSource(glob: string): string {
       if (glob[i + 1] === "*") {
         out += ".*";
         i++;
-      } else out += "[^/]*";
+      } else {
+        out += "[^/]*";
+      }
       continue;
     }
     if (ch === "?") {
@@ -333,8 +376,9 @@ function parseEditorConfigContent(content: string): {
 
     switch (key) {
       case "indent_style":
-        if (value === "space" || value === "tab")
+        if (value === "space" || value === "tab") {
           current.props.indent_style = value;
+        }
         break;
       case "indent_size":
         current.props.indent_size = value === "tab" ? "tab" : toNumber(value);
@@ -343,8 +387,9 @@ function parseEditorConfigContent(content: string): {
         current.props.tab_width = toNumber(value);
         break;
       case "end_of_line":
-        if (value === "lf" || value === "crlf" || value === "cr")
+        if (value === "lf" || value === "crlf" || value === "cr") {
           current.props.end_of_line = value;
+        }
         break;
       case "trim_trailing_whitespace":
         current.props.trim_trailing_whitespace = parseBoolean(value);
@@ -364,7 +409,7 @@ async function loadEditorConfig(
 ): Promise<EditorConfig> {
   const absolutePath = resolve(filePath);
   const root = resolve(cwd);
-  if (relative(root, absolutePath).startsWith("..")) return {};
+  if (!isWithinRoot(root, absolutePath)) return {};
 
   const merged: EditorConfig = {};
   const configs: Array<{ path: string; content: string }> = [];
@@ -375,14 +420,12 @@ async function loadEditorConfig(
     const content = await readTextIfExists(configPath);
     if (content !== undefined) {
       configs.push({ path: configPath, content });
-      const parsed = parseEditorConfigContent(content);
-      if (parsed.root) break;
+      if (parseEditorConfigContent(content).root) break;
     }
     if (current === root) break;
     const parent = dirname(current);
-    if (parent === current) break;
+    if (parent === current || !isWithinRoot(root, parent)) break;
     current = parent;
-    if (relative(root, current).startsWith("..")) break;
   }
 
   configs.reverse();
@@ -417,6 +460,7 @@ async function runCommand(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let killTimer: NodeJS.Timeout | undefined;
 
     const finish = (
       kind: "resolve" | "reject",
@@ -425,15 +469,19 @@ async function runCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       signal?.removeEventListener("abort", onAbort);
-      if (kind === "resolve")
+      if (kind === "resolve") {
         resolvePromise(value as { stdout: string; stderr: string });
-      else reject(value);
+      } else {
+        reject(value);
+      }
     };
 
     const stopChild = () => {
       child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 100).unref();
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 100);
+      killTimer.unref();
     };
 
     const timer = setTimeout(() => {
@@ -524,10 +572,8 @@ async function prettierSupports(filePath: string): Promise<PrettierSupport> {
         absolutePath,
         "--log-level",
         "silent",
-        "--no-config",
-        "--no-editorconfig",
         "--ignore-path",
-        "/dev/null",
+        NULL_IGNORE_PATH,
       ]);
       const info = JSON.parse(result.stdout) as {
         inferredParser?: string | null;
@@ -548,10 +594,7 @@ async function prettierSupports(filePath: string): Promise<PrettierSupport> {
   })();
 
   prettierSupportCache.set(absolutePath, promise);
-
-  // Evict on failure so transient errors don't stick.
   promise.catch(() => prettierSupportCache.delete(absolutePath));
-
   return promise;
 }
 
@@ -567,8 +610,8 @@ async function formatWithPrettier(
       filePath,
       "--log-level",
       "silent",
-      "--no-config",
-      "--no-editorconfig",
+      "--ignore-path",
+      NULL_IGNORE_PATH,
     ],
     input,
     FORMATTER_TIMEOUT_MS,
@@ -703,13 +746,6 @@ async function formatText(
   };
 }
 
-function splitBom(text: string): { bom: string; text: string } {
-  if (text.startsWith("\uFEFF")) {
-    return { bom: "\uFEFF", text: text.slice(1) };
-  }
-  return { bom: "", text };
-}
-
 async function formatFileInPlace(
   filePath: string,
   cwd: string,
@@ -738,11 +774,12 @@ async function writeAndFormatFile(
   filePath: string,
   content: string,
 ): Promise<void> {
+  const store = toolCallContext.getStore();
   await writeFile(filePath, content, "utf8");
   const outcome = await formatFileInPlace(
     filePath,
-    process.cwd(),
-    toolCallContext.getStore()?.signal,
+    store?.cwd ?? process.cwd(),
+    store?.signal,
   );
   storeFormatOutcome(outcome);
 }
@@ -758,17 +795,22 @@ function appendFormattingNote(
   if (!outcome) return text;
 
   const parts: string[] = [];
-  if (outcome.formatter === "clang-format") {
-    parts.push(
-      `formatted with clang-format (${outcome.formatterSource ?? "config/defaults"})`,
-    );
-  } else if (outcome.formatter === "prettier") {
-    parts.push("formatted with prettier");
-  } else if (outcome.editorconfigApplied) {
-    parts.push("applied .editorconfig whitespace rules");
+  if (outcome.skippedReason) {
+    parts.push(outcome.skippedReason);
   }
 
-  if (outcome.skippedReason) parts.push(outcome.skippedReason);
+  if (outcome.changed || outcome.editorconfigApplied) {
+    if (outcome.formatter === "clang-format") {
+      parts.unshift(
+        `formatted with clang-format (${outcome.formatterSource ?? "config/defaults"})`,
+      );
+    } else if (outcome.formatter === "prettier") {
+      parts.unshift("formatted with prettier");
+    } else if (outcome.editorconfigApplied) {
+      parts.unshift("applied .editorconfig whitespace rules");
+    }
+  }
+
   if (parts.length === 0) return text;
   return `${text} ${parts.join("; ")}.`;
 }
@@ -778,6 +820,12 @@ function updateTextContent(
   outcome: FormatOutcome | undefined,
 ): Array<TextContent | { type: string; text?: string }> {
   if (!outcome) return content;
+
+  const noteNeeded =
+    outcome.changed ||
+    outcome.editorconfigApplied ||
+    Boolean(outcome.skippedReason);
+  if (!noteNeeded) return content;
 
   let replaced = false;
   const next = content.map((block) => {
@@ -806,19 +854,24 @@ function updateTextContent(
 // ---------------------------------------------------------------------------
 
 export default function formatOnWriteExtension(pi: ExtensionAPI): void {
+  if (!claimExtensionInstance()) return;
+
   pi.on("session_start", () => clearFormattingState());
-  pi.on("session_shutdown", () => clearFormattingState());
+  pi.on("session_shutdown", () => {
+    clearFormattingState();
+    releaseExtensionInstance();
+  });
 
-  const cwd = process.cwd();
+  const extensionCwd = process.cwd();
 
-  const writeTool = createWriteToolDefinition(cwd, {
+  const writeTool = createWriteToolDefinition(extensionCwd, {
     operations: {
       mkdir: (dir) => mkdir(dir, { recursive: true }).then(() => {}),
       writeFile: (filePath, content) => writeAndFormatFile(filePath, content),
     },
   });
 
-  const editTool = createEditToolDefinition(cwd, {
+  const editTool = createEditToolDefinition(extensionCwd, {
     operations: {
       access: (filePath) => access(filePath, constants.R_OK | constants.W_OK),
       readFile: (filePath) => readFile(filePath),
@@ -829,7 +882,7 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     ...writeTool,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      return toolCallContext.run({ toolCallId, signal }, () =>
+      return toolCallContext.run({ toolCallId, cwd: ctx.cwd, signal }, () =>
         writeTool.execute(toolCallId, params, signal, onUpdate, ctx),
       );
     },
@@ -838,7 +891,7 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     ...editTool,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      return toolCallContext.run({ toolCallId, signal }, () =>
+      return toolCallContext.run({ toolCallId, cwd: ctx.cwd, signal }, () =>
         editTool.execute(toolCallId, params, signal, onUpdate, ctx),
       );
     },
