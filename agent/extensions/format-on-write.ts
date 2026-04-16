@@ -26,7 +26,10 @@ import {
 import { dirname, join, resolve } from "node:path";
 import type { TextContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createEditTool, createWriteTool } from "@mariozechner/pi-coding-agent";
+import {
+  createEditToolDefinition,
+  createWriteToolDefinition,
+} from "@mariozechner/pi-coding-agent";
 
 type FormatterName = "clang-format" | "prettier";
 
@@ -54,6 +57,11 @@ const formatResults = new Map<string, FormatOutcome>();
 type PrettierSupport = { supported: boolean; skippedReason?: string };
 
 const prettierSupportCache = new Map<string, Promise<PrettierSupport>>();
+
+function clearFormattingState(): void {
+  formatResults.clear();
+  prettierSupportCache.clear();
+}
 
 function getExtension(filePath: string): string {
   const dot = filePath.lastIndexOf(".");
@@ -499,7 +507,6 @@ function applyEditorConfigRules(
 
   if (
     config.insert_final_newline === true &&
-    next.length > 0 &&
     !next.endsWith("\n") &&
     !next.endsWith("\r")
   ) {
@@ -651,9 +658,17 @@ function updateTextContent(
 }
 
 export default function formatOnWriteExtension(pi: ExtensionAPI): void {
+  pi.on("session_start", () => {
+    clearFormattingState();
+  });
+
+  pi.on("session_shutdown", () => {
+    clearFormattingState();
+  });
+
   const cwd = process.cwd();
 
-  const writeTool = createWriteTool(cwd, {
+  const writeTool = createWriteToolDefinition(cwd, {
     operations: {
       mkdir: (dir) => mkdir(dir, { recursive: true }).then(() => {}),
       async writeFile(filePath, content) {
@@ -662,7 +677,7 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
     },
   });
 
-  const editTool = createEditTool(cwd, {
+  const editTool = createEditToolDefinition(cwd, {
     operations: {
       access: (filePath) => access(filePath, constants.R_OK | constants.W_OK),
       readFile: (filePath) => readFile(filePath),
@@ -673,36 +688,19 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "write",
-    label: "write",
-    description: writeTool.description,
-    promptSnippet: "Create or overwrite files",
-    promptGuidelines: ["Use write only for new files or complete rewrites."],
-    parameters: writeTool.parameters,
-    async execute(toolCallId, params, signal, onUpdate) {
+    ...writeTool,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       return toolCallContext.run({ toolCallId }, () =>
-        writeTool.execute(toolCallId, params, signal, onUpdate),
+        writeTool.execute(toolCallId, params, signal, onUpdate, ctx),
       );
     },
   });
 
   pi.registerTool({
-    name: "edit",
-    label: "edit",
-    description: editTool.description,
-    promptSnippet:
-      "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
-    promptGuidelines: [
-      "Use edit for precise changes (edits[].oldText must match exactly)",
-      "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-      "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-      "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-    ],
-    parameters: editTool.parameters,
-    renderShell: "self",
-    async execute(toolCallId, params, signal, onUpdate) {
+    ...editTool,
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       return toolCallContext.run({ toolCallId }, () =>
-        editTool.execute(toolCallId, params, signal, onUpdate),
+        editTool.execute(toolCallId, params, signal, onUpdate, ctx),
       );
     },
   });
