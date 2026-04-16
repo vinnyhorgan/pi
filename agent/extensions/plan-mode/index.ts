@@ -186,9 +186,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 You are in plan mode - a read-only exploration mode for safe code analysis.
 
 Restrictions:
-- You can only use: read, bash, grep, find, ls
 - You CANNOT use: edit, write (file modifications are disabled)
 - Bash is restricted to an allowlist of read-only commands (compilation and inspection are allowed)
+- All other tools (read, bash, grep, find, ls, web search, library docs, etc.) are available
 
 You may compile code to check for errors, run static analysis, inspect binaries, read headers, and check man pages.
 Do NOT modify any files.
