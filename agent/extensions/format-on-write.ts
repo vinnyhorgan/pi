@@ -8,6 +8,7 @@
  * - `.c` and `.h` use `clang-format` from PATH
  * - Prettier-supported files use `prettier` from PATH
  * - Files not handled by either formatter get `.editorconfig` whitespace rules only
+ * - Formatter failures fall back to raw/editorconfig output instead of breaking tool calls
  *
  * `.editorconfig` does NOT post-process files already handled by clang-format or
  * Prettier. It only applies to non-auto-formatted files.
@@ -15,7 +16,13 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { access, constants, mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  access,
+  constants,
+  mkdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { TextContent } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -37,14 +44,16 @@ type FormatOutcome = {
   formatter?: FormatterName;
   formatterSource?: string;
   editorconfigApplied: boolean;
+  skippedReason?: string;
 };
 
 const C_EXTENSIONS = new Set([".c", ".h"]);
 const CLANG_FORMAT_CONFIG_FILES = [".clang-format", "_clang-format"];
 const toolCallContext = new AsyncLocalStorage<{ toolCallId: string }>();
 const formatResults = new Map<string, FormatOutcome>();
-const editorConfigCache = new Map<string, Promise<EditorConfig>>();
-const prettierSupportCache = new Map<string, Promise<boolean>>();
+type PrettierSupport = { supported: boolean; skippedReason?: string };
+
+const prettierSupportCache = new Map<string, Promise<PrettierSupport>>();
 
 function getExtension(filePath: string): string {
   const dot = filePath.lastIndexOf(".");
@@ -76,7 +85,10 @@ function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-function applyLineEnding(text: string, endOfLine: EditorConfig["end_of_line"]): string {
+function applyLineEnding(
+  text: string,
+  endOfLine: EditorConfig["end_of_line"],
+): string {
   const normalized = normalizeLineEndings(text);
   if (endOfLine === "crlf") return normalized.replace(/\n/g, "\r\n");
   if (endOfLine === "cr") return normalized.replace(/\n/g, "\r");
@@ -87,6 +99,16 @@ function toNumber(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function summarizeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message
+      .split(/\r?\n/)
+      .find((line) => line.trim().length > 0)
+      ?.trim() ?? "unknown error"
+  );
 }
 
 function parseBoolean(value: string | undefined): boolean | undefined {
@@ -148,7 +170,8 @@ function expandBraces(pattern: string): string[] {
         const to = Number(numeric[2]);
         const step = from <= to ? 1 : -1;
         const out: string[] = [];
-        for (let n = from; step > 0 ? n <= to : n >= to; n += step) out.push(String(n));
+        for (let n = from; step > 0 ? n <= to : n >= to; n += step)
+          out.push(String(n));
         return out;
       })()
     : splitTopLevelComma(body);
@@ -206,19 +229,27 @@ function globToRegexSource(glob: string): string {
   return out;
 }
 
-function matchEditorConfigSection(section: string, relativePath: string): boolean {
+function matchEditorConfigSection(
+  section: string,
+  relativePath: string,
+): boolean {
   const normalized = relativePath.replace(/\\/g, "/");
 
   for (const expanded of expandBraces(section)) {
     const source = globToRegexSource(expanded);
-    const regex = expanded.includes("/") ? new RegExp(`^${source}$`) : new RegExp(`^(?:.*/)?${source}$`);
+    const regex = expanded.includes("/")
+      ? new RegExp(`^${source}$`)
+      : new RegExp(`^(?:.*/)?${source}$`);
     if (regex.test(normalized)) return true;
   }
 
   return false;
 }
 
-function parseEditorConfigContent(content: string): { root: boolean; sections: Array<{ pattern: string; props: EditorConfig }> } {
+function parseEditorConfigContent(content: string): {
+  root: boolean;
+  sections: Array<{ pattern: string; props: EditorConfig }>;
+} {
   const lines = content.split(/\r?\n/);
   const sections: Array<{ pattern: string; props: EditorConfig }> = [];
   let root = false;
@@ -238,7 +269,10 @@ function parseEditorConfigContent(content: string): { root: boolean; sections: A
     if (eq === -1) continue;
 
     const key = line.slice(0, eq).trim().toLowerCase();
-    const value = line.slice(eq + 1).trim().toLowerCase();
+    const value = line
+      .slice(eq + 1)
+      .trim()
+      .toLowerCase();
 
     if (!current) {
       if (key === "root") root = value === "true";
@@ -247,7 +281,8 @@ function parseEditorConfigContent(content: string): { root: boolean; sections: A
 
     switch (key) {
       case "indent_style":
-        if (value === "space" || value === "tab") current.props.indent_style = value;
+        if (value === "space" || value === "tab")
+          current.props.indent_style = value;
         break;
       case "indent_size":
         current.props.indent_size = value === "tab" ? "tab" : toNumber(value);
@@ -256,7 +291,8 @@ function parseEditorConfigContent(content: string): { root: boolean; sections: A
         current.props.tab_width = toNumber(value);
         break;
       case "end_of_line":
-        if (value === "lf" || value === "crlf" || value === "cr") current.props.end_of_line = value;
+        if (value === "lf" || value === "crlf" || value === "cr")
+          current.props.end_of_line = value;
         break;
       case "trim_trailing_whitespace":
         current.props.trim_trailing_whitespace = parseBoolean(value);
@@ -274,49 +310,46 @@ function parseEditorConfigContent(content: string): { root: boolean; sections: A
 
 async function loadEditorConfig(filePath: string): Promise<EditorConfig> {
   const absolutePath = resolve(filePath);
-  const cached = editorConfigCache.get(absolutePath);
-  if (cached) return cached;
+  const merged: EditorConfig = {};
+  const configs: Array<{ path: string; content: string }> = [];
+  let current = dirname(absolutePath);
 
-  const promise = (async () => {
-    const merged: EditorConfig = {};
-    const configs: Array<{ path: string; content: string }> = [];
-    let current = dirname(absolutePath);
-
-    for (;;) {
-      const configPath = join(current, ".editorconfig");
-      const content = await readTextIfExists(configPath);
-      if (content !== undefined) {
-        configs.push({ path: configPath, content });
-        const parsed = parseEditorConfigContent(content);
-        if (parsed.root) break;
-      }
-
-      const parent = dirname(current);
-      if (parent === current) break;
-      current = parent;
+  for (;;) {
+    const configPath = join(current, ".editorconfig");
+    const content = await readTextIfExists(configPath);
+    if (content !== undefined) {
+      configs.push({ path: configPath, content });
+      const parsed = parseEditorConfigContent(content);
+      if (parsed.root) break;
     }
 
-    configs.reverse();
-    for (const config of configs) {
-      const parsed = parseEditorConfigContent(config.content);
-      const configDir = resolve(dirname(config.path));
-      const relativePath = absolutePath.slice(configDir.length + 1).replace(/\\/g, "/");
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
 
-      for (const section of parsed.sections) {
-        if (matchEditorConfigSection(section.pattern, relativePath)) {
-          Object.assign(merged, section.props);
-        }
+  configs.reverse();
+  for (const config of configs) {
+    const parsed = parseEditorConfigContent(config.content);
+    const configDir = resolve(dirname(config.path));
+    const relativePath = absolutePath
+      .slice(configDir.length + 1)
+      .replace(/\\/g, "/");
+
+    for (const section of parsed.sections) {
+      if (matchEditorConfigSection(section.pattern, relativePath)) {
+        Object.assign(merged, section.props);
       }
     }
+  }
 
-    return merged;
-  })();
-
-  editorConfigCache.set(absolutePath, promise);
-  return promise;
+  return merged;
 }
 
-async function findUp(startDir: string, names: readonly string[]): Promise<string | undefined> {
+async function findUp(
+  startDir: string,
+  names: readonly string[],
+): Promise<string | undefined> {
   let current = resolve(startDir);
 
   for (;;) {
@@ -331,7 +364,11 @@ async function findUp(startDir: string, names: readonly string[]): Promise<strin
   }
 }
 
-async function runCommand(command: string, args: string[], input?: string): Promise<{ stdout: string; stderr: string }> {
+async function runCommand(
+  command: string,
+  args: string[],
+  input?: string,
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
@@ -359,45 +396,94 @@ async function runCommand(command: string, args: string[], input?: string): Prom
 
 function buildClangFallbackStyle(editorConfig: EditorConfig): string {
   const parts = ["BasedOnStyle: LLVM"];
-  const indentWidth = editorConfig.indent_size === "tab" ? editorConfig.tab_width : editorConfig.indent_size;
-  const tabWidth = editorConfig.tab_width ?? (typeof indentWidth === "number" ? indentWidth : undefined);
+  const indentWidth =
+    editorConfig.indent_size === "tab"
+      ? editorConfig.tab_width
+      : editorConfig.indent_size;
+  const tabWidth =
+    editorConfig.tab_width ??
+    (typeof indentWidth === "number" ? indentWidth : undefined);
 
   if (editorConfig.indent_style === "tab") parts.push("UseTab: ForIndentation");
   if (editorConfig.indent_style === "space") parts.push("UseTab: Never");
-  if (typeof indentWidth === "number") parts.push(`IndentWidth: ${indentWidth}`);
+  if (typeof indentWidth === "number")
+    parts.push(`IndentWidth: ${indentWidth}`);
   if (typeof tabWidth === "number") parts.push(`TabWidth: ${tabWidth}`);
 
   return `{${parts.join(", ")}}`;
 }
 
-async function formatWithClang(filePath: string, input: string, editorConfig: EditorConfig): Promise<{ text: string; source: string }> {
+async function formatWithClang(
+  filePath: string,
+  input: string,
+  editorConfig: EditorConfig,
+): Promise<{ text: string; source: string }> {
   const configPath = await findUp(dirname(filePath), CLANG_FORMAT_CONFIG_FILES);
-  const args = ["--assume-filename", filePath, configPath ? "--style=file" : `--style=${buildClangFallbackStyle(editorConfig)}`];
+  const args = [
+    "--assume-filename",
+    filePath,
+    configPath
+      ? "--style=file"
+      : `--style=${buildClangFallbackStyle(editorConfig)}`,
+  ];
   const result = await runCommand("clang-format", args, input);
   return { text: result.stdout, source: configPath ?? "LLVM fallback" };
 }
 
-async function prettierSupports(filePath: string): Promise<boolean> {
+async function prettierSupports(filePath: string): Promise<PrettierSupport> {
   const absolutePath = resolve(filePath);
   const cached = prettierSupportCache.get(absolutePath);
   if (cached) return cached;
 
   const promise = (async () => {
-    const result = await runCommand("prettier", ["--file-info", absolutePath, "--log-level", "silent"]);
-    const info = JSON.parse(result.stdout) as { inferredParser?: string | null; ignored?: boolean };
-    return !info.ignored && typeof info.inferredParser === "string" && info.inferredParser.length > 0;
-  })();
+    try {
+      const result = await runCommand("prettier", [
+        "--file-info",
+        absolutePath,
+        "--log-level",
+        "silent",
+      ]);
+      const info = JSON.parse(result.stdout) as {
+        inferredParser?: string | null;
+        ignored?: boolean;
+      };
+      return {
+        supported:
+          !info.ignored &&
+          typeof info.inferredParser === "string" &&
+          info.inferredParser.length > 0,
+      };
+    } catch (error) {
+      return {
+        supported: false,
+        skippedReason: `prettier unavailable: ${summarizeError(error)}`,
+      };
+    }
+  })().catch((error) => {
+    prettierSupportCache.delete(absolutePath);
+    throw error;
+  });
 
   prettierSupportCache.set(absolutePath, promise);
   return promise;
 }
 
-async function formatWithPrettier(filePath: string, input: string): Promise<string> {
-  const result = await runCommand("prettier", ["--stdin-filepath", filePath, "--log-level", "silent"], input);
+async function formatWithPrettier(
+  filePath: string,
+  input: string,
+): Promise<string> {
+  const result = await runCommand(
+    "prettier",
+    ["--stdin-filepath", filePath, "--log-level", "silent"],
+    input,
+  );
   return result.stdout;
 }
 
-function applyEditorConfigRules(text: string, config: EditorConfig): { text: string; applied: boolean } {
+function applyEditorConfigRules(
+  text: string,
+  config: EditorConfig,
+): { text: string; applied: boolean } {
   let next = text;
   let applied = false;
 
@@ -411,50 +497,81 @@ function applyEditorConfigRules(text: string, config: EditorConfig): { text: str
     applied = true;
   }
 
-  if (config.insert_final_newline === true && next.length > 0 && !next.endsWith("\n") && !next.endsWith("\r")) {
-    next += config.end_of_line === "crlf" ? "\r\n" : config.end_of_line === "cr" ? "\r" : "\n";
+  if (
+    config.insert_final_newline === true &&
+    next.length > 0 &&
+    !next.endsWith("\n") &&
+    !next.endsWith("\r")
+  ) {
+    next +=
+      config.end_of_line === "crlf"
+        ? "\r\n"
+        : config.end_of_line === "cr"
+          ? "\r"
+          : "\n";
     applied = true;
   }
 
   return { text: next, applied };
 }
 
-async function formatText(filePath: string, input: string): Promise<{ text: string; outcome: FormatOutcome }> {
+async function formatText(
+  filePath: string,
+  input: string,
+): Promise<{ text: string; outcome: FormatOutcome }> {
   const editorConfig = await loadEditorConfig(filePath);
 
-  if (isCFile(filePath)) {
-    const formatted = await formatWithClang(filePath, input, editorConfig);
+  const applyEditorconfigFallback = (skippedReason?: string) => {
+    const editorconfigResult = applyEditorConfigRules(input, editorConfig);
     return {
-      text: formatted.text,
+      text: editorconfigResult.text,
       outcome: {
-        changed: formatted.text !== input,
-        formatter: "clang-format",
-        formatterSource: formatted.source,
-        editorconfigApplied: false,
+        changed: editorconfigResult.text !== input,
+        editorconfigApplied: editorconfigResult.applied,
+        skippedReason,
       },
     };
-  }
-
-  if (await prettierSupports(filePath)) {
-    const formatted = await formatWithPrettier(filePath, input);
-    return {
-      text: formatted,
-      outcome: {
-        changed: formatted !== input,
-        formatter: "prettier",
-        editorconfigApplied: false,
-      },
-    };
-  }
-
-  const editorconfigResult = applyEditorConfigRules(input, editorConfig);
-  return {
-    text: editorconfigResult.text,
-    outcome: {
-      changed: editorconfigResult.text !== input,
-      editorconfigApplied: editorconfigResult.applied,
-    },
   };
+
+  if (isCFile(filePath)) {
+    try {
+      const formatted = await formatWithClang(filePath, input, editorConfig);
+      return {
+        text: formatted.text,
+        outcome: {
+          changed: formatted.text !== input,
+          formatter: "clang-format",
+          formatterSource: formatted.source,
+          editorconfigApplied: false,
+        },
+      };
+    } catch (error) {
+      return applyEditorconfigFallback(
+        `clang-format failed: ${summarizeError(error)}`,
+      );
+    }
+  }
+
+  const prettierSupport = await prettierSupports(filePath);
+  if (prettierSupport.supported) {
+    try {
+      const formatted = await formatWithPrettier(filePath, input);
+      return {
+        text: formatted,
+        outcome: {
+          changed: formatted !== input,
+          formatter: "prettier",
+          editorconfigApplied: false,
+        },
+      };
+    } catch (error) {
+      return applyEditorconfigFallback(
+        `prettier failed: ${summarizeError(error)}`,
+      );
+    }
+  }
+
+  return applyEditorconfigFallback(prettierSupport.skippedReason);
 }
 
 async function formatFileInPlace(filePath: string): Promise<FormatOutcome> {
@@ -471,42 +588,63 @@ function storeFormatOutcome(outcome: FormatOutcome): void {
   if (store) formatResults.set(store.toolCallId, outcome);
 }
 
-async function writeAndFormatFile(filePath: string, content: string): Promise<void> {
+async function writeAndFormatFile(
+  filePath: string,
+  content: string,
+): Promise<void> {
   await writeFile(filePath, content, "utf8");
   const outcome = await formatFileInPlace(filePath);
   storeFormatOutcome(outcome);
 }
 
-function appendFormattingNote(text: string, outcome: FormatOutcome | undefined): string {
+function appendFormattingNote(
+  text: string,
+  outcome: FormatOutcome | undefined,
+): string {
   if (!outcome) return text;
 
   const parts: string[] = [];
   if (outcome.formatter === "clang-format") {
-    parts.push(`formatted with clang-format (${outcome.formatterSource ?? "config/defaults"})`);
+    parts.push(
+      `formatted with clang-format (${outcome.formatterSource ?? "config/defaults"})`,
+    );
   } else if (outcome.formatter === "prettier") {
     parts.push("formatted with prettier from PATH");
   } else if (outcome.editorconfigApplied) {
     parts.push("applied .editorconfig whitespace rules");
   }
 
+  if (outcome.skippedReason) {
+    parts.push(outcome.skippedReason);
+  }
+
   if (parts.length === 0) return text;
   return `${text} ${parts.join("; ")}.`;
 }
 
-function updateTextContent(content: (TextContent | { type: string; text?: string })[], outcome: FormatOutcome | undefined) {
+function updateTextContent(
+  content: (TextContent | { type: string; text?: string })[],
+  outcome: FormatOutcome | undefined,
+) {
   if (!outcome) return content;
 
   let replaced = false;
   const next = content.map((block) => {
     if (!replaced && block.type === "text") {
       replaced = true;
-      return { ...block, text: appendFormattingNote(block.text ?? "", outcome) };
+      return {
+        ...block,
+        text: appendFormattingNote(block.text ?? "", outcome),
+      };
     }
     return block;
   });
 
   if (!replaced) {
-    next.push({ type: "text", text: appendFormattingNote("Formatting applied", outcome) });
+    next.push({
+      type: "text",
+      text: appendFormattingNote("Formatting applied", outcome),
+    });
   }
 
   return next;
@@ -542,7 +680,9 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
     promptGuidelines: ["Use write only for new files or complete rewrites."],
     parameters: writeTool.parameters,
     async execute(toolCallId, params, signal, onUpdate) {
-      return toolCallContext.run({ toolCallId }, () => writeTool.execute(toolCallId, params, signal, onUpdate));
+      return toolCallContext.run({ toolCallId }, () =>
+        writeTool.execute(toolCallId, params, signal, onUpdate),
+      );
     },
   });
 
@@ -550,7 +690,8 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
     name: "edit",
     label: "edit",
     description: editTool.description,
-    promptSnippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+    promptSnippet:
+      "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
     promptGuidelines: [
       "Use edit for precise changes (edits[].oldText must match exactly)",
       "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
@@ -560,12 +701,15 @@ export default function formatOnWriteExtension(pi: ExtensionAPI): void {
     parameters: editTool.parameters,
     renderShell: "self",
     async execute(toolCallId, params, signal, onUpdate) {
-      return toolCallContext.run({ toolCallId }, () => editTool.execute(toolCallId, params, signal, onUpdate));
+      return toolCallContext.run({ toolCallId }, () =>
+        editTool.execute(toolCallId, params, signal, onUpdate),
+      );
     },
   });
 
   pi.on("tool_result", async (event) => {
-    if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
+    if (event.toolName !== "edit" && event.toolName !== "write")
+      return undefined;
 
     const outcome = formatResults.get(event.toolCallId);
     formatResults.delete(event.toolCallId);
